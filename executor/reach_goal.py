@@ -1,0 +1,124 @@
+#!/usr/bin/env python3
+import time
+from copy import deepcopy
+import numpy as np
+from numpy.typing import NDArray
+from typing import List, Dict, Any, Tuple
+from scipy.optimize import minimize
+from scipy.signal import savgol_filter
+from scipy.sparse import csc_matrix, eye
+
+from executor.executor import Executor
+from datatypes import *
+from evaluator import *
+from model import Model
+from objective import Objective, ReachGoalObjective
+
+
+class ReachGoalExecutor(Executor):
+    def __init__(self):
+        # super.__init__()
+        pass
+
+    def execute(self,
+                agent: Agent,
+                other_agents: List[Agent],
+                scenario: Scenario,
+                x_0: np.ndarray,
+                x_g: np.ndarray,
+                v_g: np.ndarray,
+                lambda_k: np.ndarray,
+                objective: Objective,
+                horizon: int,
+                w_esp: float= 0.000001,
+                maxiter: int = 30,
+                ftol: float = 0.001,
+                eps: float = 1e-4) -> Tuple[NDArray[np.float64], bool]:
+        """Execute the reach goal task using MPC"""
+        U0 = np.tile(agent.control, horizon)
+        u_max = agent.u_bounds[0, 1]
+        u_min = agent.u_bounds[0, 0]
+        bounds = [(u_min, u_max)] * (2 * horizon) + \
+            [(-np.inf, np.inf)] * horizon
+
+        constraints = []
+
+        res = minimize(
+            lambda U: self._compute_cost(
+                model=agent.model,
+                U=U,
+                x_0=x_0,
+                x_g=x_g,
+                v_g=v_g,
+                lambda_k=lambda_k,
+                objective=objective,
+                horizon=horizon,
+                dt=0.1,
+                w_eps=w_esp),
+            U0, method='SLSQP', bounds=bounds, constraints=constraints,
+            options={
+                'maxiter': maxiter,
+                'ftol': ftol,
+                'disp': False,
+                'eps': eps
+            }
+        )
+        return res.x, res.success
+
+    def _simulate_trajectory(self,
+                             model: Model,
+                             x0: NDArray[np.float64],
+                             U: NDArray[np.float64],
+                             N: int,
+                             dt: float) -> NDArray[np.float64]:
+        """Simulate the trajectory given initial state and control inputs."""
+        trajectory = [x0.copy()]
+        x = x0.copy()
+        for k in range(N):
+            u = U[3*k:3*k+2]
+            x = model.f(x, u, dt)
+            trajectory.append(x.copy())
+        return trajectory
+
+    def _compute_cost(self,
+                      model: Model,
+                      U: np.ndarray,
+                      x_0: np.ndarray,
+                      x_g: np.ndarray,
+                      v_g: np.ndarray,
+                      lambda_k: np.ndarray,
+                      objective: Objective,
+                      horizon: int,
+                      dt: float,
+                      w_eps: float = 0.000001,
+                      k_eps: float = 1000.0) -> float:
+        """Compute the MPC cost including control effort and task-specific costs."""
+        cost = 0.0
+        trajectory = self._simulate_trajectory(model, x_0, U, horizon, dt)
+
+        for k in range(horizon):
+            u = U[3*k:3*k+2]  # Extract [u_x_k, u_y_k]
+            # Control effort
+            cost += 0.5 * np.linalg.norm(u)**2
+
+            # Task objective
+            x_k = trajectory[k+1]
+            u_with_slack = U[3*k:3*k+3]  # [u_x_k, u_y_k, eps_k]
+            task_cost = objective.evaluate(
+                model=model,
+                x=x_k,
+                u=u_with_slack,
+                x_g=x_g,
+                dx_g_dt=v_g,
+                gamma=1.0,
+                r=0.1
+            )
+            # Add Lagrangian and penalty terms
+            cost += lambda_k[k] * task_cost + (w_eps / 2) * task_cost**2
+
+        # Slack penalties
+        for k in range(horizon):
+            eps = U[3*k+2]  # Slack variable for step k
+            cost += k_eps * eps**2
+
+        return cost

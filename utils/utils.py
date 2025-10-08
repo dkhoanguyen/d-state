@@ -337,8 +337,8 @@ def animate_agent_trajectories(agents, result, scenario, save_format=None, save_
     
 
         ax.set_aspect('equal')
-        # ax.set_xlim([-np.max(task_locations) * 1.4, np.max(task_locations) * 1.4])
-        # ax.set_ylim([-np.max(task_locations) * 1.4, np.max(task_locations) * 1.4])
+        ax.set_xlim([-45, 45])
+        ax.set_ylim([-45, 45])
         ax.set_xlabel('X Coordinate')
         ax.set_ylabel('Y Coordinate')
 

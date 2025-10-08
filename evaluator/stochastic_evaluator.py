@@ -207,3 +207,8 @@ class IFTStochasticEvaluator(Evaluator):
         probs = np.flip(probs)
 
         return probs[k]
+    
+    def preprocess(self,
+                   joint_action: NDArray[np.float64]):
+        prob = self._poisson_binomial_distribution(joint_action)
+        return np.sum(prob)

@@ -41,7 +41,7 @@ class PeakedRewardDeterministicEvaluator(Evaluator):
                                          joint_actions: np.ndarray,
                                          min_num: int):
         return
-    
+
     def calculate_reward(
         self,
         agent: Agent,
@@ -61,6 +61,10 @@ class PeakedRewardDeterministicEvaluator(Evaluator):
         joint_actions: NDArray[np.float64]
     ) -> float:
         return 0.0
+    
+    def preprocess(self,
+                   joint_action: NDArray[np.float64]):
+        return 1.0
 
 
 class SubmodularRewardDeterministicEvaluator(Evaluator):
@@ -121,3 +125,7 @@ class SubmodularRewardDeterministicEvaluator(Evaluator):
         joint_actions: NDArray[np.float64]
     ) -> float:
         return 0.0
+
+    def preprocess(self,
+                   joint_action: NDArray[np.float64]):
+        return 1.0

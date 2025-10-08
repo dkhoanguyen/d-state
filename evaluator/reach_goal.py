@@ -70,8 +70,6 @@ class ReachGoalEvaluator(Evaluator):
         joint_actions: NDArray[np.float64]
     ) -> float:
         cost = 0.0
-        probs = self._poisson_binomial_distribution(joint_actions)
-
         x0 = agent.state
 
         # TODO: Change this to use the full control sequence instead of 
@@ -104,7 +102,7 @@ class ReachGoalEvaluator(Evaluator):
             cost += agent.goal_lambda * task_cost + \
                 (w_eps / 2) * task_cost**2
 
-        expected_cost = np.sum(probs) * cost 
+        expected_cost = cost 
         return expected_cost
     
     def _poisson_binomial_distribution(self, probabilities: NDArray[np.float64]) -> float:
@@ -157,3 +155,8 @@ class ReachGoalEvaluator(Evaluator):
             x = model.f(x, u, dt)
             trajectory.append(x.copy())
         return trajectory
+    
+    def preprocess(self,
+                   joint_action: NDArray[np.float64]):
+        prob = self._poisson_binomial_distribution(joint_action)
+        return np.sum(prob)

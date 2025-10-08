@@ -44,3 +44,9 @@ class Evaluator(ABC):
                                          min_num: int):
         """
         """
+
+    @abstractmethod
+    def preprocess(self,
+                   joint_action: NDArray[np.float64]):
+        """
+        """
