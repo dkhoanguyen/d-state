@@ -1,0 +1,13 @@
+settings:
+  general:
+    max_iterations: 350
+  
+  miqp:
+  grape:
+  d_state:
+    planning_budget: 15
+    reward_weight: 5.0
+    cost_weight: 2.0
+    temperature: 20
+    learning_rate: 0.012
+    horizon: 10

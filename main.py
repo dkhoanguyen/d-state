@@ -14,28 +14,35 @@ from allocator import DSTATE
 
 
 def main():
+    # Load settings
     # Parameters
     num_agents = 20
-    num_tasks = 5
+    num_tasks = 2
     full_comms = True
     # Run mission
     planning_budget = 10
     max_iterations = 350
 
     comm_distance = 5
-    gap_task = 15,
     agent_location_range = [5, 5]
-    task_location_range = [60, 60]
+
+    # Load scenarios
 
     # Specify tasks
     tasks = []
-    reach_goal_locations = 0.5*np.array([
-        [-5.0, 60.0],
-        [50.0, -10.0],
-        [75.0, -25],
-        [-65.0, -40.0],
-        [-9.0, -65.0],
+    reach_goal_locations = np.array([
+        [-2.5, 30.0],
+        [25.0, -5.0],
+        [37.5, -12.5],
+        [-32.5, -20.0],
+        [-4.5, -32.5],
     ])
+
+    # reach_goal_locations = np.array([
+    #     [-25.5, 0.0],
+    #     [25.0, 0.0],
+    # ])
+
     for reach_goal_location in reach_goal_locations:
         task = ReachGoalTask()
         task.location = reach_goal_location

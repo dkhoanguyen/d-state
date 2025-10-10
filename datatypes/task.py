@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 
 import numpy as np
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Callable, Optional, List, Tuple
 from abc import ABC, abstractmethod
 from numpy.typing import NDArray
 
@@ -44,7 +45,29 @@ class ReachGoalTask(Task):
 
     
 @dataclass
-class ExploreTask(Task):
-    pass
+class ErgodicCoverageTask:
+    """Template-compatible task describing the ergodic MPC spec."""
+    # ---- Task base fields (keep for compatibility with your Task ABC) ----
+    reward: float = 0.0
+    capabilities_required: NDArray[np.float64] = field(default_factory=lambda: np.zeros(1))
+    task_type: TaskType = TaskType.EXPLORE
+    is_completed: bool = False
+    progress: float = 0.0
+
+    # ---- Ergodic-specific fields ----
+    dt: float = 0.1                       # MPC step (s)
+    c_init: NDArray[np.float64] = field(default_factory=lambda: np.zeros(1))  # (nK,)
+    t_init: float = 1e-2                  # initial averaging time t
+    c_clf: float = 0.2                    # CLF rate
+    A: int = 1                            # number of robots participating
+    E_threshold: float = 1e-3             # completion threshold on E(c)
+    centers: NDArray[np.float64] = None
+    covs: NDArray[np.float64] = None
+
+    def get_complete_status(self, E_current: float) -> bool:
+        """Mark complete when E(c) is below a threshold."""
+        self.is_completed = (E_current <= self.E_threshold)
+        return self.is_completed
+    
 
 

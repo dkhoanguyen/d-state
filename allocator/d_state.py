@@ -12,9 +12,9 @@ from scipy.sparse import csc_matrix, eye
 from allocator.allocator import Allocator
 from datatypes import *
 from evaluator import *
-from executor import ReachGoalExecutor
+from executor import ReachGoalExecutor, ErgodicCoverageExecutor
 from model import Model
-from objective import Objective, ReachGoalObjective
+from objective import Objective, ReachGoalObjective, ErgodicCoverageObjective
 from constraint import Constraint, ObstacleAvoidanceConstraint, InterRobotCollisionAvoidance
 
 class DSTATE(Allocator):
@@ -89,7 +89,6 @@ class DSTATE(Allocator):
         num_tasks = scenario.num_tasks
         T = 20  # Temperature for gradient update
         alpha = 0.012  # Learning rate
-        rho = 0.7
         horizon = 10
 
         # Plan task
@@ -102,7 +101,6 @@ class DSTATE(Allocator):
             max_iter=15,
             annealing_rate=0.0005,
             alpha=alpha,
-            rho=rho,
             horizon=horizon)
 
         # Plan control actions
@@ -114,8 +112,8 @@ class DSTATE(Allocator):
             scenario=scenario,
             horizon=horizon)
 
-        # Update task progress
-        agent = self._update_progress(agent, scenario, horizon)
+        # # Update task progress
+        # agent = self._update_progress(agent, scenario, horizon)
 
         return agent
 
@@ -142,7 +140,6 @@ class DSTATE(Allocator):
                    max_iter: int,
                    annealing_rate: float,
                    alpha: float,
-                   rho: float,
                    horizon: int):
         num_tasks = scenario.num_tasks
         current_task_id = agent.allocation[agent.id]
@@ -260,6 +257,7 @@ class DSTATE(Allocator):
         joint_actions[agent.id] = agent.action[task_id]
 
         E_C_x = 0.0
+        prob = 0.0
         if scenario.tasks[task_id].task_type == TaskType.REACH_GOAL:
             prob = self._reach_goal_evaluator.preprocess(
                 joint_action=joint_actions)
@@ -283,6 +281,7 @@ class DSTATE(Allocator):
         joint_actions[agent.id] = 1.0
 
         E_C_x_i = 0.0
+        prob = 0.0
         if scenario.tasks[task_id].task_type == TaskType.REACH_GOAL:
             prob = self._reach_goal_evaluator.preprocess(
                 joint_action=joint_actions)
@@ -305,70 +304,70 @@ class DSTATE(Allocator):
             trajectory.append(x.copy())
         return trajectory
 
-    def _update_progress(self, agent: Agent, scenario: Scenario, horizon: int):
-        task_id = agent.allocation[agent.id]
-        current_task: ReachGoalTask = scenario.tasks[task_id]
-        x0 = agent.state
-        x_g = current_task.location
+    # def _update_progress(self, agent: Agent, scenario: Scenario, horizon: int):
+    #     task_id = agent.allocation[agent.id]
+    #     current_task: ReachGoalTask = scenario.tasks[task_id]
+    #     x0 = agent.state
+    #     x_g = current_task.location
 
-        u0 = (x_g - x0)
-        v_max = agent.u_bounds[0, 1]
-        if np.linalg.norm(u0) > v_max:
-            u0 = v_max * (u0 / np.linalg.norm(u0))
-        u0 = np.hstack((u0, 0.0))
+    #     u0 = (x_g - x0)
+    #     v_max = agent.u_bounds[0, 1]
+    #     if np.linalg.norm(u0) > v_max:
+    #         u0 = v_max * (u0 / np.linalg.norm(u0))
+    #     u0 = np.hstack((u0, 0.0))
 
-        u = np.tile(u0, horizon)
-        trajectory = self._simulate_trajectory(
-            model=agent.model,
-            x0=x0,
-            U=u,
-            N=horizon,
-        )
+    #     u = np.tile(u0, horizon)
+    #     trajectory = self._simulate_trajectory(
+    #         model=agent.model,
+    #         x0=x0,
+    #         U=u,
+    #         N=horizon,
+    #     )
 
-        hypo_progress = []
-        for k in range(horizon):
-            x_k = trajectory[k]
-            progress_k = self._reach_goal_objective.progress(
-                model=agent.model,
-                x=x_k,
-                u=u0,
-                x_g=x_g,
-                dx_g_dt=np.zeros(2),
-                gamma=1.0,
-                r=0.1
-            )
-            hypo_progress.append(progress_k)
+    #     hypo_progress = []
+    #     for k in range(horizon):
+    #         x_k = trajectory[k]
+    #         progress_k = self._reach_goal_objective.progress(
+    #             model=agent.model,
+    #             x=x_k,
+    #             u=u0,
+    #             x_g=x_g,
+    #             dx_g_dt=np.zeros(2),
+    #             gamma=1.0,
+    #             r=0.1
+    #         )
+    #         hypo_progress.append(progress_k)
 
-        u0 = agent.control
-        u = np.tile(u0, horizon)
-        trajectory = self._simulate_trajectory(
-            model=agent.model,
-            x0=x0,
-            U=u,
-            N=horizon,
-        )
+    #     u0 = agent.control
+    #     u = np.tile(u0, horizon)
+    #     trajectory = self._simulate_trajectory(
+    #         model=agent.model,
+    #         x0=x0,
+    #         U=u,
+    #         N=horizon,
+    #     )
 
-        true_progress = []
-        for k in range(horizon):
-            x_k = trajectory[k]
-            progress_k = self._reach_goal_objective.progress(
-                model=agent.model,
-                x=x_k,
-                u=u0,
-                x_g=x_g,
-                dx_g_dt=np.zeros(2),
-                gamma=1.0,
-                r=0.1
-            )
-            true_progress.append(progress_k)
+    #     true_progress = []
+    #     for k in range(horizon):
+    #         x_k = trajectory[k]
+    #         progress_k = self._reach_goal_objective.progress(
+    #             model=agent.model,
+    #             x=x_k,
+    #             u=u0,
+    #             x_g=x_g,
+    #             dx_g_dt=np.zeros(2),
+    #             gamma=1.0,
+    #             r=0.1
+    #         )
+    #         true_progress.append(progress_k)
 
-        hypo_progress = np.diff(hypo_progress)
-        true_progress = np.diff(true_progress)
+    #     hypo_progress = np.diff(hypo_progress)
+    #     true_progress = np.diff(true_progress)
 
-        progress = np.maximum(np.minimum(np.abs(
-            true_progress[-1] - true_progress[0]) / np.abs(hypo_progress[-1] - hypo_progress[0]), 1.0), 0.0)
-        d_sigma = 0.05 * (1 - progress)
-        return agent
+    #     progress = np.maximum(np.minimum(np.abs(
+    #         true_progress[-1] - true_progress[0]) / np.abs(hypo_progress[-1] - hypo_progress[0]), 1.0), 0.0)
+    #     d_sigma = 0.05 * (1 - progress)
+    #     return agent
 
     def _plan_control_action(self, agent: Agent, agents: List[Agent], task_id: int, scenario: Scenario,horizon:int):
         if task_id < 0:
@@ -378,7 +377,8 @@ class DSTATE(Allocator):
             agent = self._reach_goal_mpc(
                 agent, agents, scenario.tasks[task_id], scenario,horizon)
         elif scenario.tasks[task_id].task_type == TaskType.EXPLORE:
-            pass
+            agent = self._ergodic_coverage_mpc(
+                agent, agents, scenario.tasks[task_id], scenario,horizon)
         elif scenario.tasks[task_id].task_type == TaskType.HERDING:
             pass
         return agent
@@ -390,9 +390,6 @@ class DSTATE(Allocator):
                         scenario: Scenario,
                         horizon: int,
                         w_eps: float = 0.000001):
-        x_0 = agent.state
-        x_g = task.location
-        v_g = np.zeros((2))
         lambda_k = np.ones(horizon) * agent.goal_lambda
 
         # Run optimization
@@ -400,9 +397,7 @@ class DSTATE(Allocator):
             agent=agent,
             other_agents=other_agents,
             scenario=scenario,
-            x_0=x_0,
-            x_g=x_g,
-            v_g=v_g,
+            task=task,
             lambda_k=lambda_k,
             objective=self._reach_goal_objective,
             horizon=horizon,
@@ -415,7 +410,7 @@ class DSTATE(Allocator):
             new_lambda_k = lambda_k.copy()
             trajectory = self._simulate_trajectory(
                 model=agent.model,
-                x0=x_0,
+                x0=agent.state,
                 U=U_opt,
                 N=horizon
             )
@@ -426,10 +421,10 @@ class DSTATE(Allocator):
                     model=agent.model,
                     x=x_k,
                     u=u_with_slack,
-                    x_g=x_g,
-                    dx_g_dt=np.zeros(2),
+                    x_g=task.location,
+                    dx_g_dt=task.velocity,
                     gamma=1.0,
-                    r=0.1
+                    r=task.radius
                 )
                 new_lambda_k[k] = max(
                     0, lambda_k[k] + w_eps * task_cost)
@@ -441,4 +436,13 @@ class DSTATE(Allocator):
                 2)
             agent.goal_lambda = lambda_k[0]
 
+        return agent
+    
+    def _ergodic_coverage_mpc(self, 
+                        agent: Agent, 
+                        other_agents: List[Agent], 
+                        task: ErgodicCoverageTask, 
+                        scenario: Scenario,
+                        horizon: int,
+                        w_eps: float = 0.000001):
         return agent

@@ -16,17 +16,12 @@ from objective import Objective, ReachGoalObjective
 
 
 class ReachGoalExecutor(Executor):
-    def __init__(self):
-        # super.__init__()
-        pass
 
     def execute(self,
                 agent: Agent,
                 other_agents: List[Agent],
                 scenario: Scenario,
-                x_0: np.ndarray,
-                x_g: np.ndarray,
-                v_g: np.ndarray,
+                task: ReachGoalTask,
                 lambda_k: np.ndarray,
                 objective: Objective,
                 horizon: int,
@@ -47,9 +42,10 @@ class ReachGoalExecutor(Executor):
             lambda U: self._compute_cost(
                 model=agent.model,
                 U=U,
-                x_0=x_0,
-                x_g=x_g,
-                v_g=v_g,
+                x_0=agent.state,
+                x_g=task.location,
+                v_g=task.velocity,
+                radius=task.radius,
                 lambda_k=lambda_k,
                 objective=objective,
                 horizon=horizon,
@@ -86,6 +82,7 @@ class ReachGoalExecutor(Executor):
                       x_0: np.ndarray,
                       x_g: np.ndarray,
                       v_g: np.ndarray,
+                      radius: float, 
                       lambda_k: np.ndarray,
                       objective: Objective,
                       horizon: int,
@@ -111,7 +108,7 @@ class ReachGoalExecutor(Executor):
                 x_g=x_g,
                 dx_g_dt=v_g,
                 gamma=1.0,
-                r=0.1
+                r=radius
             )
             # Add Lagrangian and penalty terms
             cost += lambda_k[k] * task_cost + (w_eps / 2) * task_cost**2

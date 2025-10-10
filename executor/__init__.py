@@ -2,3 +2,4 @@
 
 from .executor import *
 from .reach_goal import *
+from .ergodic_coverage import ErgodicCoverageExecutor
