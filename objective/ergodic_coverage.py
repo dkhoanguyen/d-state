@@ -58,9 +58,12 @@ class ErgodicCoverageObjective(Objective):
         gradE_j = (2/(t*A)) * sum_k Lam_k (c_k - phi_k) * gradF_k(x_j).
     """
 
-    def __init__(self, basis: FourierBasis, phi: NDArray[np.float64]):
-        self.basis = basis
-        self.phi = np.asarray(phi, dtype=float)
+    def __init__(self):
+        L = np.array([1.0, 1.0])
+        Kmax = (4, 4)
+        self.basis = FourierBasis(L=L, Kmax=Kmax)
+        # self.phi = np.asarray(phi, dtype=float)
+        self.phi = None
 
     # one-step (instant) CLF constraint for the whole team, sum over j
     def evaluate(self,

@@ -63,6 +63,7 @@ class ErgodicCoverageTask:
     E_threshold: float = 1e-3             # completion threshold on E(c)
     centers: NDArray[np.float64] = None
     covs: NDArray[np.float64] = None
+    basis = None
 
     def get_complete_status(self, E_current: float) -> bool:
         """Mark complete when E(c) is below a threshold."""

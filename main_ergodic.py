@@ -55,6 +55,7 @@ def main():
         obstacles=None
     )
     actions = generate_initial_action(scenario=scenario, deterministic=False)
+    
     # Initialise agents
     agents = ScenarioGenerator.generate_agents(
         num_tasks=num_tasks,

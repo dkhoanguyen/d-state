@@ -29,35 +29,51 @@ class ErgodicCoverageExecutor(Executor):
 
     def __init__(self,
                  w_eps: float = 1e-6, k_eps: float = 1e3):
-        self.basis = basis
-        self.objective = objective
         self.w_eps = float(w_eps)  # penalty on CLF row (squared)
         self.k_eps = float(k_eps)  # penalty on slack
 
     def execute(self,
-                agent: Agent,
-                other_agents: List[Agent],
-                scenario: Scenario,
-                task: ErgodicCoverageTask,
-                lambda_k: NDArray[np.float64],
-                objective: ErgodicCoverageObjective,   # kept for signature parity; not used (we use self.objective)
-                horizon: int,
-                maxiter: int = 30,
-                ftol: float = 1e-3,
-                eps: float = 1e-4) -> Tuple[NDArray[np.float64], bool]:
+            agent: Agent,
+            other_agents: List[Agent],
+            scenario: Scenario,
+            task: ErgodicCoverageTask,
+            lambda_k: NDArray[np.float64],
+            objective: ErgodicCoverageObjective,   # kept for signature parity
+            horizon: int,
+            maxiter: int = 30,
+            ftol: float = 1e-3,
+            eps: float = 1e-4) -> Tuple[NDArray[np.float64], bool]:
         """
         Returns:
-            U*: np.ndarray of shape (3*horizon,) stacking [ux,uy,delta] per step
-            success: bool from SciPy
+            U*: (n_dec*horizon,) stacking [u_components..., delta] per step
+            success: bool
         """
-        # Initial guess: repeat current control + zero slack
-        U0 = np.tile(np.hstack([agent.control, 0.0]), horizon)
+        # --- decide per-step decision dimension ---
+        # controls per step (from agent.control), +1 slack delta
+        m_u = int(np.size(agent.control))        # e.g., 2 for [ux,uy]; could be 1 if scalar
+        n_dec_step = m_u + 1                     # add slack delta
 
-        u_max = agent.u_bounds[0, 1]
-        u_min = agent.u_bounds[0, 0]
-        # Bounds per step: [ux, uy, delta]
-        bounds = [(u_min, u_max), (u_min, u_max), (0.0, np.inf)] * horizon
+        # --- initial guess: repeat current control and zero slack ---
+        z_step0 = np.hstack([np.atleast_1d(agent.control), 0.0])   # shape (n_dec_step,)
+        U0 = np.tile(z_step0, horizon)                              # shape (n_dec_step*horizon,)
 
+        # --- bounds per step ---
+        # prefer agent.u_bounds if available; otherwise fall back to [-1,1]
+        if hasattr(agent, "u_bounds") and agent.u_bounds is not None:
+            u_min = float(agent.u_bounds[0, 0])
+            u_max = float(agent.u_bounds[0, 1])
+        else:
+            u_min, u_max = -1.0, 1.0
+
+        step_bounds = [(u_min, u_max)] * m_u + [(0.0, np.inf)]      # delta >= 0
+        bounds = step_bounds * horizon
+
+        # --- sanity checks before calling SciPy ---
+        assert U0.ndim == 1
+        assert len(bounds) == U0.size, f"bounds ({len(bounds)}) != len(U0) ({U0.size})"
+        assert len(lambda_k) == horizon, "lambda_k must have length == horizon"
+
+        # --- call the optimizer ---
         res = minimize(
             lambda U: self._compute_cost(
                 model=agent.model,
@@ -65,12 +81,15 @@ class ErgodicCoverageExecutor(Executor):
                 x0=agent.state.copy(),
                 task=task,
                 lambda_k=lambda_k,
-                horizon=horizon
+                horizon=horizon,
+                objective=objective,
+                dt=task.dt,
+                num_agents=task.A
             ),
             U0, method='SLSQP', bounds=bounds, constraints=[],
             options={'maxiter': maxiter, 'ftol': ftol, 'disp': False, 'eps': eps}
         )
-        return res.x, res.success
+        return res.x, bool(res.success)
 
     # ---------- rollout and cost ----------
     def _compute_cost(self,
@@ -90,7 +109,6 @@ class ErgodicCoverageExecutor(Executor):
         """
         dt = dt
         A = num_agents
-        F_avg_provider: Optional[Callable[[int, np.ndarray], np.ndarray]] = getattr(task, "F_avg_provider", None)
         c_clf = float(task.c_clf)
 
         # Predicted c, t along the horizon (copied from task initial values)
@@ -110,13 +128,9 @@ class ErgodicCoverageExecutor(Executor):
             # Advance state with model
             x = model.f(x, uk, dt)
 
-            # Predict Fourier average for c update
-            if F_avg_provider is not None:
-                F_avg_k = F_avg_provider(k, x)
-            else:
-                # single-agent approximation (if A>1, scale to average)
-                F_local = self.basis.F_vec(x[:2])
-                F_avg_k = F_local / max(A, 1)
+            # single-agent approximation (if A>1, scale to average)
+            F_local = objective.basis.F_vec(x[:2])
+            F_avg_k = F_local / max(A, 1)
 
             # Running-average update for c (discrete Euler)
             #   c <- c + dt * ((F_avg - c) / t)

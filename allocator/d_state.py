@@ -37,6 +37,7 @@ class DSTATE(Allocator):
         self._obstacles = obstacles
 
         self._reach_goal_objective = ReachGoalObjective()
+        self._ergodic_coverage_objective = ErgodicCoverageObjective()
 
         self._objective_dict = {}
         for id, task in enumerate(tasks):
@@ -49,9 +50,11 @@ class DSTATE(Allocator):
 
         # Evaluator
         self._reach_goal_evaluator = ReachGoalEvaluator()
+        # self._ergodic_coverage_evaluator = Ergod
 
         # Executor
         self._reach_goal_executor = ReachGoalExecutor()
+        self._ergodic_coverage_executor = ErgodicCoverageExecutor()
 
         # For keeping track of mission
         self._max_progress = 0.0
@@ -445,4 +448,14 @@ class DSTATE(Allocator):
                         scenario: Scenario,
                         horizon: int,
                         w_eps: float = 0.000001):
+        lambda_k = np.ones(horizon) * agent.goal_lambda
+        # Run optimization
+        U_opt, success = self._ergodic_coverage_executor.execute(
+            agent=agent,
+            other_agents=other_agents,
+            scenario=scenario,
+            task=task,
+            lambda_k=lambda_k,
+            objective=self._ergodic_coverage_objective,
+            horizon=horizon)
         return agent
