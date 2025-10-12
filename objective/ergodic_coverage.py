@@ -5,13 +5,7 @@ from typing import List, Sequence, Tuple
 from objective import Objective
 from model import Model
 
-# ============================================================
-# Modular, N-robot, decentralized Ergodic CLF-only controller
-# - Tunable Gaussian Mixture rho(x)
-# - Rectangular domain with cosine Fourier basis
-# - Each robot solves a *local* CLF-QP
-# - Low-bandwidth shared step = average of F_k(x_j) across robots
-# ============================================================
+from datatypes import *
 
 class FourierBasis:
     def __init__(self, L: NDArray[np.float64], Kmax: Tuple[int, int]):
@@ -46,26 +40,90 @@ class FourierBasis:
             G[i, 0] = gx
             G[i, 1] = gy
         return G
+    
+class GaussianMixtureDensity:
+    def __init__(self, L, gridN=201):
+        self.L = np.asarray(L, dtype=float)
+        self.gridN = int(gridN)
+        xs = np.linspace(0, self.L[0], self.gridN)
+        ys = np.linspace(0, self.L[1], self.gridN)
+        self.X, self.Y = np.meshgrid(xs, ys, indexing='xy')
+        self.P = np.stack([self.X, self.Y], axis=-1)
+        self.dxdy = (self.L[0] / (self.gridN - 1)) * (self.L[1] / (self.gridN - 1))
+        self.rho = None
 
+    @staticmethod
+    def _gaussian_2d(P, mu, Sigma):
+        d = P - mu
+        Sinv = np.linalg.inv(Sigma)
+        expo = np.einsum('...i,ij,...j->...', d, Sinv, d)
+        det = np.linalg.det(Sigma)
+        coef = 1.0 / (2.0 * np.pi * np.sqrt(det))
+        return coef * np.exp(-0.5 * expo)
+
+    @staticmethod
+    def rotated_cov(sig1, sig2, theta_rad):
+        c, s = np.cos(theta_rad), np.sin(theta_rad)
+        R = np.array([[c, -s], [s, c]])
+        return R @ np.diag([sig1**2, sig2**2]) @ R.T
+
+    def build(self, centers, covs, weights):
+        if len(centers) != len(covs) or len(centers) != len(weights):
+            raise ValueError("centers, covs, and weights must have equal length.")
+        w = np.asarray(weights, dtype=float)
+        if np.any(w < 0):
+            raise ValueError("weights must be nonnegative.")
+        w = w / (w.sum() + 1e-16)
+
+        mix = np.zeros(self.P.shape[:2], dtype=float)
+        for mu, Sigma, a in zip(centers, covs, w):
+            mix += a * self._gaussian_2d(self.P, np.array(mu), np.array(Sigma))
+
+        mix /= (mix.sum() * self.dxdy + 1e-16)  # normalize to integrate to 1
+        self.rho = mix
+        return self.rho
+
+    def phi_coeffs(self, basis: FourierBasis):
+        if self.rho is None:
+            raise RuntimeError("Call build(...) first to create rho.")
+        phi = np.zeros(basis.nK, dtype=float)
+        for i, (kx, ky) in enumerate(basis.modes):
+            phi[i] = np.sum(self.rho *
+                            np.cos(np.pi * kx * self.X / basis.L[0]) *
+                            np.cos(np.pi * ky * self.Y / basis.L[1])) * self.dxdy
+        return phi
+
+
+# ============================================================
+# Objective: CLF row (≥0 form) with cached φ
+# ============================================================
 class ErgodicCoverageObjective(Objective):
     """
-    CLF row (≥ 0 form) for ergodic coverage with A robots:
-
-        g = (-c_clf * E + delta) - sum_j gradE_j(x_j,t,c)^T u_j  >= 0,
-
-    where:
-        E(c) = sum_k Lam_k (c_k - phi_k)^2,
-        gradE_j = (2/(t*A)) * sum_k Lam_k (c_k - phi_k) * gradF_k(x_j).
+    g_local = (-c_clf * E(c) + δ) - ∇E(x,t,c)^T u  >= 0
+    E(c) = Σ_k Λ_k (c_k - φ_k)^2
+    ∇E   = (2/(t*A)) Σ_k Λ_k (c_k - φ_k) ∇F_k(x)
     """
+    def __init__(self, L=(1.0,1.0), Kmax=(4,4)):
+        self.basis = FourierBasis(L=np.array(L, dtype=float), Kmax=Kmax)
+        self._gmm = GaussianMixtureDensity(L=np.array(L, dtype=float), gridN=201)
+        self.phi: Optional[NDArray[np.float64]] = None
+        self._cached_target = None  # (centers,covs,weights) tuple to avoid rebuilds
 
-    def __init__(self):
-        L = np.array([1.0, 1.0])
-        Kmax = (4, 4)
-        self.basis = FourierBasis(L=L, Kmax=Kmax)
-        # self.phi = np.asarray(phi, dtype=float)
-        self.phi = None
+    def set_target(self, centers, covs, weights):
+        """Build rho and cache φ once."""
+        self._gmm.build(centers, covs, weights)
+        self.phi = self._gmm.phi_coeffs(self.basis)
+        self._cached_target = (tuple(map(tuple, centers)),
+                               tuple(map(tuple, [tuple(row) for row in covs])),
+                               tuple(weights))
 
-    # one-step (instant) CLF constraint for the whole team, sum over j
+    def ensure_phi(self, centers, covs, weights):
+        key = (tuple(map(tuple, centers)),
+               tuple(map(tuple, [tuple(row) for row in covs])),
+               tuple(weights))
+        if self.phi is None or self._cached_target != key:
+            self.set_target(centers, covs, weights)
+
     def evaluate(self,
                  model: Model,
                  x: NDArray[np.float64],
@@ -73,33 +131,20 @@ class ErgodicCoverageObjective(Objective):
                  c: NDArray[np.float64],
                  t_now: float,
                  c_clf: float,
+                 centers,
+                 covs,
+                 weights,
                  A: int = 1,
                  delta: float = 0.0) -> float:
-        """
-        x: current state of THIS agent (2D position used)
-        u: control of THIS agent [ux,uy,eps] (eps=delta for this local row)
-        c: running-average Fourier coeffs (nK,)
-        t_now: averaging time t (>0)
-        c_clf: CLF rate
-        A: number of robots (affects the gradient scaling)
-        delta: slack for THIS local row
-
-        Returns g >= 0 when the CLF row is satisfied for this agent alone:
-            g_local = (-c_clf * E + delta) - gradE^T u
-        """
         assert t_now > 0.0
-        # metric
+        self.ensure_phi(centers, covs, weights)
+
         diff = (c - self.phi)
         E = float(np.sum(self.basis.Lam * diff * diff))
-        # gradient at this agent
-        gradF = self.basis.gradF_mat(x[:2])                 # (nK,2)
-        gradE = (2.0 / (t_now * max(A, 1))) * (self.basis.Lam * diff) @ gradF  # (2,)
-        # local row (use the local agent's slack delta = u[-1] if you like)
-        u_xy = u[:2]
-        g_local = (-c_clf * E + float(delta)) - float(gradE @ u_xy)
-        return g_local
+        gradF = self.basis.gradF_mat(x[:2])
+        gradE = (2.0 / (t_now * max(A, 1))) * (self.basis.Lam * diff) @ gradF
+        return (-c_clf * E + float(delta)) - float(gradE @ u[:2])
 
-    # monitoring (no slack)
     def progress(self,
                  model: Model,
                  x: NDArray[np.float64],
@@ -108,7 +153,7 @@ class ErgodicCoverageObjective(Objective):
                  t_now: float,
                  c_clf: float,
                  A: int = 1) -> float:
-        assert t_now > 0.0
+        assert t_now > 0.0 and self.phi is not None, "Call set_target(...) first."
         diff = (c - self.phi)
         E = float(np.sum(self.basis.Lam * diff * diff))
         gradF = self.basis.gradF_mat(x[:2])

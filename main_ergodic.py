@@ -14,7 +14,7 @@ from allocator import DSTATE
 
 
 def main():
-    num_agents = 2
+    num_agents = 1
     num_tasks = 1
     full_comms = True
     # Run mission
@@ -22,7 +22,7 @@ def main():
     max_iterations = 350
 
     comm_distance = 5
-    agent_location_range = [5, 5]
+    agent_location_range = [0.1, 0.1]
 
     tasks = []
     centers = [[0.25, 0.70],
@@ -35,11 +35,13 @@ def main():
     task = ErgodicCoverageTask()
     task.capabilities_required = 0
     task.t_init = 1e-2
-    task.c_clf = 0.2
+    task.c_clf = 10.0
+    task.w_clf = 20.0
     task.A = 1
     task.E_threshold = 1e-3
     task.centers = centers
     task.covs = covs
+    task.weights = [0.5,0.5]
     tasks.append(task)
 
     # Create an instance of ScenarioGenerator
@@ -54,6 +56,7 @@ def main():
         tasks=tasks,
         obstacles=None
     )
+    scenario.agent_locations = np.array([[0.1,0.1]])
     actions = generate_initial_action(scenario=scenario, deterministic=False)
     
     # Initialise agents
@@ -88,6 +91,26 @@ def main():
 
     print("Init done")
 
+    rho = allocator._ergodic_coverage_executor._gmm.build(task.centers,task.covs,task.weights)
+
+    X = np.empty((0,2))
+    for local_agent in agents:
+        X = np.vstack((X,local_agent.state))
+    # Live plotting
+    plt.ion()
+    fig, ax = plt.subplots(figsize=(6.8, 6.4), dpi=140)
+    im = ax.imshow(rho.T, origin="lower", extent=[0, 1, 0, 1], interpolation="bilinear")
+    paths = [ax.plot([], [], lw=1.8, label=f"r{j+1}")[0] for j in range(num_agents)]
+    pts = ax.plot(X[:, 0], X[:, 1], 'o', ms=6)[0]
+    ax.set_xlim(0, 1); ax.set_ylim(0, 1); ax.set_aspect('equal', adjustable='box')
+    cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    ax.set_xlabel("x"); ax.set_ylabel("y")
+    ax.legend(loc="upper right", ncols=2, fontsize=8)
+
+    # Logging
+    traj = [X.copy()]
+
+
     while consensus_step < max_iterations:
         # Record current states
         current_states = np.array([agent.state for agent in agents])
@@ -120,7 +143,30 @@ def main():
 
             planning_time += time.time() - start_time
 
+            # Apply control
+            control = agents[agent_id].control[:2]
+
+            agents[agent_id].state = agents[agent_id].model.f(
+                agents[agent_id].state, control)
+            
+        X = np.empty((0,2))
+        for local_agent in agents:
+            X = np.vstack((X,local_agent.state))
+
+        X = np.minimum(np.maximum(X, 0.0), np.array([1.0, 1.0]))
+        arr = np.stack(traj, axis=0)
+        for j in range(num_agents):
+            paths[j].set_data(arr[:, j, 0], arr[:, j, 1])
+        pts.set_data(X[:, 0], X[:, 1])
+        plt.pause(0.1)
+
+
+
         consensus_step += 1
+
+
+    plt.ioff()
+    plt.show()
 
 
 if __name__ == "__main__":

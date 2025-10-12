@@ -448,6 +448,7 @@ class DSTATE(Allocator):
                         scenario: Scenario,
                         horizon: int,
                         w_eps: float = 0.000001):
+        horizon = 1
         lambda_k = np.ones(horizon) * agent.goal_lambda
         # Run optimization
         U_opt, success = self._ergodic_coverage_executor.execute(
@@ -458,4 +459,6 @@ class DSTATE(Allocator):
             lambda_k=lambda_k,
             objective=self._ergodic_coverage_objective,
             horizon=horizon)
+        if success:
+            agent.control = U_opt            
         return agent

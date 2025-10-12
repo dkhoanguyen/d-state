@@ -1,29 +1,21 @@
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy.optimize import minimize, LinearConstraint, Bounds
+from scipy.optimize import minimize, Bounds  # <- no LinearConstraint needed
 
 # ============================================================
 # Modular, N-robot, decentralized Ergodic CLF-only controller
-# - Tunable Gaussian Mixture rho(x)
-# - Rectangular domain with cosine Fourier basis
-# - Each robot solves a *local* CLF-QP
-# - Low-bandwidth shared step = average of F_k(x_j) across robots
+# (Augmented Lagrangian for the CLF inequality)
 # ============================================================
 
 # -------------------- Fourier basis --------------------
 class FourierBasis:
     def __init__(self, L, Kmax):
-        """
-        L: array-like, domain size [Lx, Ly]
-        Kmax: tuple (Kx, Ky) inclusive maximum orders
-        """
         self.L = np.asarray(L, dtype=float)
         self.Kmax = tuple(int(k) for k in Kmax)
         self.modes = [(kx, ky)
                       for kx in range(self.Kmax[0] + 1)
                       for ky in range(self.Kmax[1] + 1)]
         self.nK = len(self.modes)
-        # Sobolev weights Λ_k
         n = len(self.L)
         self.Lam = np.array([1.0 / (1.0 + kx*kx + ky*ky) ** ((n + 1) / 2.0)
                              for (kx, ky) in self.modes], dtype=float)
@@ -44,7 +36,6 @@ class FourierBasis:
         return np.array([self.F_k(x, m) for m in self.modes], dtype=float)
 
     def gradF_mat(self, x):
-        # shape (nK, 2)
         return np.array([self.gradF_k(x, m) for m in self.modes], dtype=float)
 
 
@@ -87,7 +78,7 @@ class GaussianMixtureDensity:
         for mu, Sigma, a in zip(centers, covs, w):
             mix += a * self._gaussian_2d(self.P, np.array(mu), np.array(Sigma))
 
-        mix /= (mix.sum() * self.dxdy + 1e-16)  # normalize to integrate to 1
+        mix /= (mix.sum() * self.dxdy + 1e-16)
         self.rho = mix
         return self.rho
 
@@ -105,70 +96,85 @@ class GaussianMixtureDensity:
 # -------------------- Multi-robot Ergodic CLF Controller --------------------
 class MultiRobotErgodicCLF:
     """
-    Decentralized CLF-only controller for N robots, single-integrator dynamics.
-    Each robot solves:
-        min 0.5 ||u_j||^2 + w_clf * delta_j^2
-        s.t. gradE_j^T u_j <= -alpha_j * c_clf * E + delta_j
-             |u_j|_inf <= u_max
-             delta_j >= 0
-    Shared (low-bandwidth): F_avg = (1/N) sum_j F(x_j)
-    Running average coefficients: c <- c + dt * (F_avg - c)/t
+    Decentralized CLF-only controller using an Augmented Lagrangian for the CLF row:
+        g(z) = gradE^T u - delta - rhs_clf <= 0,  rhs_clf = -alpha*c_clf*E
+    Input bounds are kept as variable bounds: |u_i| <= u_max, delta >= 0.
     """
     def __init__(self, 
-                 basis: FourierBasis, phi, u_max=1.0, w_clf=10.0, c_clf=0.5, alphas=None):
+                 basis: FourierBasis, phi, u_max=1.0, w_clf=10.0, c_clf=0.5, alphas=None,
+                 al_rho=10.0, al_iters=5):
         self.basis = basis
         self.phi = np.asarray(phi, dtype=float)
         self.u_max = float(u_max)
         self.w_clf = float(w_clf)
         self.c_clf = float(c_clf)
-        self.c = np.zeros_like(self.phi)  # running average coefficients
-        self.t_now = 1e-2                 # avoid div-by-zero at start
+        self.c = np.zeros_like(self.phi)    # running average Fourier coeffs
+        self.t_now = 1e-2                   # avoid div-by-zero at start
         self.alphas = None if alphas is None else np.asarray(alphas, dtype=float)
+
+        # Augmented Lagrangian hyperparameters
+        self.al_rho0 = float(al_rho)
+        self.al_iters = int(al_iters)
 
     def ergodic_metric(self):
         return float(np.sum(self.basis.Lam * (self.c - self.phi) ** 2))
 
     def gradE_at(self, x, N_agents):
-        # gradE_j = (2/(t*N)) * sum_k Lambda_k (c_k - phi_k) gradF_k(x_j)
         gradF = self.basis.gradF_mat(x)         # (nK, 2)
         weights = self.basis.Lam * (self.c - self.phi)  # (nK,)
         return (2.0 / (self.t_now * N_agents)) * (weights @ gradF)  # (2,)
 
+    # -------------- Augmented Lagrangian local solver (per robot) --------------
     def local_qp(self, gradE_j, E, alpha_j):
         """
-        Solve robot j's CLF-QP:
+        Solve (with AL):
             min 0.5||u||^2 + w_clf*delta^2
-            s.t. gradE_j^T u <= -alpha_j * c_clf * E + delta
-                 |u_i| <= u_max
-                 delta >= 0
+            s.t. g(z) = gradE_j^T u - delta - rhs_clf <= 0
+                 |u_i| <= u_max, delta >= 0
         """
-        def cost(z):
-            u = z[:2]
-            d = z[2]
-            return 0.5 * np.dot(u, u) + self.w_clf * (d ** 2)
-
-        Mclf = np.zeros(3)
-        Mclf[:2] = gradE_j
-        Mclf[2] = -1.0
         rhs_clf = -alpha_j * self.c_clf * E
 
-        M = np.vstack([
-            Mclf,
-            np.array([ 1.0, 0.0, 0.0]),
-            np.array([-1.0, 0.0, 0.0]),
-            np.array([ 0.0, 1.0, 0.0]),
-            np.array([ 0.0,-1.0, 0.0]),
-        ])
-        rhs = np.array([rhs_clf, self.u_max, self.u_max, self.u_max, self.u_max], dtype=float)
+        # decision z = [u_x, u_y, delta]
+        bnds = Bounds(lb=[-self.u_max, -self.u_max, 0.0],
+                      ub=[ self.u_max,  self.u_max, np.inf])
+        
+        def f_cost(z):
+            u = z[:2]; d = z[2]
+            return 0.5 * np.dot(u, u) + self.w_clf * (d ** 2)
 
-        con = LinearConstraint(M, lb=-np.inf * np.ones_like(rhs), ub=rhs)
-        bnds = Bounds(lb=[-np.inf, -np.inf, 0.0], ub=[np.inf, np.inf, np.inf])
+        def g_ineq(z):
+            u = z[:2]; d = z[2]
+            return float(np.dot(gradE_j, u) - d - rhs_clf)  # <= 0 desired
 
-        z0 = np.zeros(3)
-        res = minimize(cost, z0, method='SLSQP', constraints=[con], bounds=bnds)
-        if not res.success:
-            return np.zeros(2), 0.0
-        return res.x[:2], res.x[2]
+        # PHR AL objective
+        def Phi(z, lam, rho):
+            g = g_ineq(z)
+            return f_cost(z) + lam * g + 0.5 * g ** 2
+
+        # AL outer loop
+        z = np.zeros(3)  # start at 0
+        lam = 0.0
+        rho = self.al_rho0
+
+        for _ in range(self.al_iters):
+            # inner solve
+            fun = lambda zz: Phi(zz, lam, rho)
+            res = minimize(fun, z, method='SLSQP', bounds=bnds)
+            z = res.x if res.success else z
+
+            print(z)
+
+            # dual update
+            g = g_ineq(z)
+            lam = max(0.0, lam + rho * g)
+
+            # (optional) adapt rho if violation persists
+            if g > 1e-3:
+                rho *= 2.0
+
+        u = z[:2]
+        delta = z[2]
+        return u, delta
 
     def step(self, X):
         """
@@ -184,17 +190,17 @@ class MultiRobotErgodicCLF:
             alphas = np.ones(N) / N
         else:
             alphas = self.alphas / (np.sum(self.alphas) + 1e-16)
-
-        # LOCAL evaluations (each robot can compute its own F_k and send to network)
+        
+        # LOCAL evaluations → low-bandwidth average
         F_list = np.stack([self.basis.F_vec(x) for x in X])  # (N, nK)
-        # LOW-BANDWIDTH SHARE: average over robots (could be via consensus)
         F_avg = F_list.mean(axis=0)
 
         # Shared running-average update
         self.c = self.c + self.dt * ((F_avg - self.c) / self.t_now)
 
-        # Build local gradients and solve local QPs
+        # Local AL solves
         E = self.ergodic_metric()
+
         U = np.zeros_like(X)
         for j in range(N):
             gE_j = self.gradE_at(X[j], N)
@@ -217,34 +223,32 @@ if __name__ == "__main__":
 
     # Build a target Gaussian Mixture rho and its Fourier coefficients phi
     gmm = GaussianMixtureDensity(L=L, gridN=201)
-
-    # Example mixture (edit freely)
-    centers = [[0.25, 0.70], [0.75, 0.30], [0.55, 0.85]]
+    centers = [[0.25, 0.70], [0.75, 0.30]]
     covs = [
         [[0.02, 0.0], [0.0, 0.02]],
         [[0.02, 0.0], [0.0, 0.02]],
-        GaussianMixtureDensity.rotated_cov(0.10, 0.03, theta_rad=np.deg2rad(35.0)),
     ]
-    weights = [0.4, 0.4, 0.2]
-
+    weights = [0.5, 0.5]
     rho = gmm.build(centers, covs, weights)
     phi = gmm.phi_coeffs(basis)
 
     # Controller
-    N = 2                                  # number of robots
+    N = 1
     dt = 0.1
-    T_steps = 2000
+    T_steps = 10
     u_max = 1.0
-    w_clf = 200.0
-    c_clf = 2.0
-    alphas = np.ones(N) / N                 # equal CLF share
+    w_clf = 20.0
+    c_clf = 10.0
+    alphas = np.ones(N) / N
 
-    ctrl = MultiRobotErgodicCLF(basis, phi, u_max=u_max, w_clf=w_clf, c_clf=c_clf, alphas=alphas)
+    ctrl = MultiRobotErgodicCLF(basis, phi, u_max=u_max, w_clf=w_clf, c_clf=c_clf, alphas=alphas,
+                                al_rho=100.0, al_iters=1)
     ctrl.set_dt(dt)
 
     # Initial states
     rng = np.random.default_rng(2)
-    X = rng.uniform(low=[0.1, 0.1], high=[0.9, 0.9], size=(N, 2))
+    # X = rng.uniform(low=[0.1, 0.1], high=[0.9, 0.9], size=(N, 2))
+    X = np.array([[0.1,0.1]])
 
     # Logging
     traj = [X.copy()]
@@ -259,28 +263,26 @@ if __name__ == "__main__":
     ax.set_xlim(0, L[0]); ax.set_ylim(0, L[1]); ax.set_aspect('equal', adjustable='box')
     cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
     cbar.set_label("ρ(x)")
-    ttl = ax.set_title("N-robot Ergodic CLF-only (Decentralized)   step 0/{}   E=0.0".format(T_steps))
+    ttl = ax.set_title("N-robot Ergodic CLF-only (AL)   step 0/{}   E=0.0".format(T_steps))
     ax.set_xlabel("x"); ax.set_ylabel("y")
     ax.legend(loc="upper right", ncols=2, fontsize=8)
 
     # Simulate
     for k in range(T_steps):
         U, E, F_avg = ctrl.step(X)
+        # print(U)
         X = X + dt * U
-        X = np.minimum(np.maximum(X, 0.0), L)  # clamp to box
+        X = np.minimum(np.maximum(X, 0.0), L)
 
         traj.append(X.copy())
         E_hist.append(E)
 
-        print(E)
-
-        # Update plot
-        arr = np.stack(traj, axis=0)  # (k+2, N, 2)
+        arr = np.stack(traj, axis=0)
         for j in range(N):
             paths[j].set_data(arr[:, j, 0], arr[:, j, 1])
         pts.set_data(X[:, 0], X[:, 1])
-        ttl.set_text(f"N-robot Ergodic CLF-only (Decentralized)   step {k+1}/{T_steps}   E={E:.3e}")
+        ttl.set_text(f"N-robot Ergodic CLF-only (AL)   step {k+1}/{T_steps}   E={E:.3e}")
         plt.pause(0.001)
 
-    plt.ioff()
-    plt.show()
+    # plt.ioff()
+    # plt.show()

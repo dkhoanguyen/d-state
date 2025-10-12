@@ -58,12 +58,17 @@ class ErgodicCoverageTask:
     dt: float = 0.1                       # MPC step (s)
     c_init: NDArray[np.float64] = field(default_factory=lambda: np.zeros(1))  # (nK,)
     t_init: float = 1e-2                  # initial averaging time t
-    c_clf: float = 0.2                    # CLF rate
+    c_clf: float = 2.0                    # CLF rate
+    w_clf = 200.0
     A: int = 1                            # number of robots participating
     E_threshold: float = 1e-3             # completion threshold on E(c)
     centers: NDArray[np.float64] = None
     covs: NDArray[np.float64] = None
+    weights: NDArray[np.float64] = None
     basis = None
+
+    # ---- Comms ----
+    alphas = None
 
     def get_complete_status(self, E_current: float) -> bool:
         """Mark complete when E(c) is below a threshold."""

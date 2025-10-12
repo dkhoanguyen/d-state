@@ -143,7 +143,6 @@ def main():
             # Apply control
             control = agents[agent_id].control[:2]
 
-            # Control breaks down
             agents[agent_id].state = agents[agent_id].model.f(
                 agents[agent_id].state, control)
 
