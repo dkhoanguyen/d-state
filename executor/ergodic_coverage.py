@@ -34,6 +34,32 @@ class ErgodicCoverageExecutor(Executor):
         self.t_now = 1e-2
         self.c = None
 
+        self.rho = 1.0
+
+    def init(self):
+        pass
+
+    def calculate_reward(
+        self,
+        agent: Agent,
+        task: ReachGoalTask,
+        other_agents: list[Agent], 
+        horizon: float,
+        joint_actions: NDArray[np.float64]
+    ) -> float:
+        pass
+
+    def calculate_cost(
+        self,
+        agent: Agent,
+        task: ReachGoalTask,
+        other_agents: list[Agent],
+        objective_controller: Objective,
+        horizon: float,
+        joint_actions: NDArray[np.float64]
+    ) -> float:
+        pass
+
     def execute(self,
                 agent: Agent,
                 other_agents: List[Agent],
@@ -49,7 +75,7 @@ class ErgodicCoverageExecutor(Executor):
         U0 = np.tile(agent.control, horizon)
         u_max = agent.u_bounds[0, 1]
         u_min = agent.u_bounds[0, 0]
-        bounds = [(u_min, u_max)] * (2 * horizon) + \
+        bnds = [(u_min, u_max)] * (2 * horizon) + \
             [(-np.inf, np.inf)] * horizon
 
         constraints = []
@@ -61,6 +87,7 @@ class ErgodicCoverageExecutor(Executor):
             alphas = np.ones(len(other_agents)) / len(other_agents)
         else:
             alphas = task.alphas / (np.sum(task.alphas) + 1e-16)
+        # print(alphas)
 
         # Aggregate all states
         X = np.empty((0,2))
@@ -79,10 +106,10 @@ class ErgodicCoverageExecutor(Executor):
         E = self.ergodic_metric()
         gE_J = self.gradE_at(agent.state, len(other_agents))
 
+        print(np.linalg.norm(gE_J))
+
         rhs_clf = -alphas[agent.id] * task.c_clf * E
         u_max = 1.0
-        bnds = Bounds(lb=[-u_max, -u_max, 0.0],
-                      ub=[u_max,  u_max, np.inf])
         
         def f_cost(z):
             u = z[:2]; d = z[2]
@@ -104,10 +131,8 @@ class ErgodicCoverageExecutor(Executor):
         res = minimize(fun, z, method='SLSQP', bounds=bnds)
         z = res.x if res.success else z
 
-        print(z)
-
         g = g_ineq(z)
-        lam = max(0.0, lam + 10 * g)
+        lam = max(0.0, lam + 1 * g)
         self.t_now += task.dt
 
         return z,res.success
@@ -116,9 +141,6 @@ class ErgodicCoverageExecutor(Executor):
                       model: Model,
                       U: np.ndarray,
                       x_0: np.ndarray,
-                      task: ErgodicCoverageTask,
-                      lambda_k: np.ndarray,
-                      objective: ErgodicCoverageObjective,
                       horizon: int,
                       dt: float,
                       w_eps: float = 0.000001,
@@ -141,112 +163,6 @@ class ErgodicCoverageExecutor(Executor):
         gradF = self.basis.gradF_mat(x)         # (nK, 2)
         weights = self.basis.Lam * (self.c - self.phi)  # (nK,)
         return (2.0 / (self.t_now * N_agents)) * (weights @ gradF)  # (2,)
-
-
-    # # -------- AL cost over the horizon --------
-    # def _al_cost(self,
-    #              U: NDArray[np.float64],
-    #              model: Model,
-    #              x0: NDArray[np.float64],
-    #              task: ErgodicCoverageTask,
-    #              objective: ErgodicCoverageObjective,
-    #              horizon: int,
-    #              lam: NDArray[np.float64],
-    #              rho: float,
-    #              n_dec_step: int,
-    #              m_u: int) -> float:
-
-    #     dt = float(task.dt)
-    #     A = int(task.A)
-    #     c_clf = float(task.c_clf)
-
-    #     c_hat = task.c_init.copy()
-    #     t_hat = float(task.t_init)
-    #     x = x0.copy()
-
-    #     J = 0.0
-    #     for k in range(horizon):
-    #         u_k = U[n_dec_step*k : n_dec_step*k + m_u]
-    #         delta_k = U[n_dec_step*k + m_u]
-
-    #         # effort + slack
-    #         J += self.w_effort * float(u_k @ u_k) + self.k_eps * (delta_k**2)
-
-    #         # Propagate dynamics
-    #         x = model.f(x, u_k, dt)
-
-    #         # Predict F_avg (single-agent approx)
-    #         F_local = objective.basis.F_vec(x[:2])
-    #         F_avg_k = F_local / max(A, 1)
-
-    #         # Update c,t
-    #         c_hat = c_hat + dt * ((F_avg_k - c_hat) / t_hat)
-    #         t_hat = t_hat + dt
-
-    #         # CLF row => g_k ≤ 0 desired
-    #         g_k = objective.evaluate(
-    #             model=model,
-    #             x=x,
-    #             u=np.hstack([u_k, delta_k]),
-    #             c=c_hat,
-    #             t_now=t_hat,
-    #             c_clf=c_clf,
-    #             centers=task.centers,
-    #             covs=task.covs,
-    #             weights=task.weights,
-    #             A=A,
-    #             delta=delta_k
-    #         )
-
-    #         # PHR AL term: 0.5*ρ*(max(0, g_k + λ_k/ρ))^2 - (λ_k^2)/(2ρ)
-    #         s = max(0.0, g_k + lam[k]/rho)
-    #         J += 0.5 * rho * (s*s) - 0.5 * (lam[k]*lam[k]) / rho
-
-    #     return float(J)
-
-    # # -------- Rollout once and return all g_k --------
-    # def _rollout_and_g(self,
-    #                    U: NDArray[np.float64],
-    #                    model: Model,
-    #                    x0: NDArray[np.float64],
-    #                    task: ErgodicCoverageTask,
-    #                    objective: ErgodicCoverageObjective,
-    #                    horizon: int,
-    #                    n_dec_step: int,
-    #                    m_u: int) -> NDArray[np.float64]:
-
-    #     dt = float(task.dt)
-    #     A = int(task.A)
-    #     c_clf = float(task.c_clf)
-    #     c_hat = task.c_init.copy()
-    #     t_hat = float(task.t_init)
-    #     x = x0.copy()
-
-    #     g_all = np.zeros(horizon, dtype=float)
-    #     for k in range(horizon):
-    #         u_k = U[n_dec_step*k : n_dec_step*k + m_u]
-    #         delta_k = U[n_dec_step*k + m_u]
-    #         x = model.f(x, u_k, dt)
-
-    #         F_local = objective.basis.F_vec(x[:2])
-    #         F_avg_k = F_local / max(A, 1)
-    #         c_hat = c_hat + dt * ((F_avg_k - c_hat) / t_hat)
-    #         t_hat = t_hat + dt
-
-    #         g_all[k] = objective.evaluate(
-    #             model=model,
-    #             x=x,
-    #             u=np.hstack([u_k, delta_k]),
-    #             c=c_hat,
-    #             t_now=t_hat,
-    #             c_clf=c_clf,
-    #             centers=task.centers,
-    #             covs=task.covs,
-    #             weights=task.weights,
-    #             A=A,
-    #             delta=delta_k
-    #         )
-    #     return g_all
     
     def _simulate_trajectory(self,
                              model: Model,
@@ -262,6 +178,47 @@ class ErgodicCoverageExecutor(Executor):
             x = model.f(x, u, dt)
             trajectory.append(x.copy())
         return trajectory
+    
+    def _poisson_binomial_distribution(self, probabilities: NDArray[np.float64]) -> float:
+        """
+        Compute the Poisson binomial distribution P(X = k) using FFT with correct ordering.
+        """
+        N = len(probabilities)
+        p = np.array(probabilities)
+
+        if not np.all((0 <= p) & (p <= 1)):
+            raise ValueError("Probabilities must be between 0 and 1")
+
+        n_points = N + 1
+        t = 2 * np.pi * np.arange(n_points) / n_points
+
+        phi_X = np.ones(n_points, dtype=complex)
+        for i in range(0, N):
+            phi_X_i = (1 - p[i]) + p[i] * np.exp(1j * t)
+            phi_X *= phi_X_i
+
+        # Compute inverse FFT and scale by 1/(N+1), then shift to correct order
+        probs = np.fft.ifft(phi_X) / (N + 1)
+        probs = np.fft.fftshift(probs)  # Shift to align k = 0 to N
+        probs = np.real(probs)
+
+        # Normalize to ensure sum = 1
+        probs_sum = np.sum(probs)
+        if abs(probs_sum - 1) > 1e-10:
+            probs = probs / probs_sum
+
+        probs = np.maximum(probs, 0)
+
+        # Reorder to ensure k = 0 is first (after shift, take the middle section)
+        probs = np.roll(probs, N // 2)
+        probs = np.flip(probs)
+
+        return probs
+    
+    def preprocess(self,
+                   joint_action: NDArray[np.float64]):
+        prob = self._poisson_binomial_distribution(joint_action)
+        return np.sum(prob)
     
 
 class GaussianMixtureDensity:

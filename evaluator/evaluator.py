@@ -28,17 +28,6 @@ class Evaluator(ABC):
         pass
 
     @abstractmethod
-    def calculate_cost(
-        self,
-        agent: Agent,
-        other_agents: list[Agent],
-        scenario: Scenario,
-        task: Task,
-        joint_actions: NDArray[np.float64]
-    ) -> float:
-        pass
-
-    @abstractmethod
     def calculate_min_number_constraints(self,
                                          joint_actions: np.ndarray,
                                          min_num: int):

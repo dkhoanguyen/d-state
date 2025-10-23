@@ -138,7 +138,7 @@ class ScenarioGenerator:
 
             # Add a slack variable to control input for mission execution
             u0 = np.hstack((u0, 0.0))
-            v_max = 4
+            v_max = 0.1
             agent_type = AgentType.DIFF_DRIVE
 
             agent = Agent(

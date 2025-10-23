@@ -79,7 +79,6 @@ def main():
         tasks=scenario.tasks,
         obstacles=scenario.obstacles)
     # Evaluators
-    prob_evaluator = IFTStochasticEvaluator()
     peak_evaluator = PeakedRewardDeterministicEvaluator()
 
     consensus_step = 0
@@ -124,7 +123,7 @@ def main():
         for agent_id, agent in enumerate(agents):
             start_time = time.time()
             agents[agent_id] = allocator.plan(
-                agent, local_agents[agent_id], scenario, prob_evaluator, planning_budget)
+                agent, local_agents[agent_id], scenario, planning_budget)
             local_agents[agent_id][agent_id] = agents[agent_id]
 
             planning_time += time.time() - start_time

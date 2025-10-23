@@ -1,288 +1,351 @@
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy.optimize import minimize, Bounds  # <- no LinearConstraint needed
+from scipy.optimize import minimize, Bounds
+from scipy.stats import multivariate_normal as mvn
 
-# ============================================================
-# Modular, N-robot, decentralized Ergodic CLF-only controller
-# (Augmented Lagrangian for the CLF inequality)
-# ============================================================
-
-# -------------------- Fourier basis --------------------
-class FourierBasis:
-    def __init__(self, L, Kmax):
-        self.L = np.asarray(L, dtype=float)
-        self.Kmax = tuple(int(k) for k in Kmax)
-        self.modes = [(kx, ky)
-                      for kx in range(self.Kmax[0] + 1)
-                      for ky in range(self.Kmax[1] + 1)]
-        self.nK = len(self.modes)
-        n = len(self.L)
-        self.Lam = np.array([1.0 / (1.0 + kx*kx + ky*ky) ** ((n + 1) / 2.0)
-                             for (kx, ky) in self.modes], dtype=float)
-
-    def F_k(self, x, k):
-        kx, ky = k
-        Lx, Ly = self.L
-        return np.cos(np.pi * kx * x[0] / Lx) * np.cos(np.pi * ky * x[1] / Ly)
-
-    def gradF_k(self, x, k):
-        kx, ky = k
-        Lx, Ly = self.L
-        gx = -(np.pi * kx / Lx) * np.sin(np.pi * kx * x[0] / Lx) * np.cos(np.pi * ky * x[1] / Ly)
-        gy = -(np.pi * ky / Ly) * np.cos(np.pi * kx * x[0] / Lx) * np.sin(np.pi * ky * x[1] / Ly)
-        return np.array([gx, gy], dtype=float)
-
-    def F_vec(self, x):
-        return np.array([self.F_k(x, m) for m in self.modes], dtype=float)
-
-    def gradF_mat(self, x):
-        return np.array([self.gradF_k(x, m) for m in self.modes], dtype=float)
-
-
-# -------------------- Gaussian Mixture density over a grid --------------------
-class GaussianMixtureDensity:
-    def __init__(self, L, gridN=201):
-        self.L = np.asarray(L, dtype=float)
-        self.gridN = int(gridN)
-        xs = np.linspace(0, self.L[0], self.gridN)
-        ys = np.linspace(0, self.L[1], self.gridN)
-        self.X, self.Y = np.meshgrid(xs, ys, indexing='xy')
-        self.P = np.stack([self.X, self.Y], axis=-1)
-        self.dxdy = (self.L[0] / (self.gridN - 1)) * (self.L[1] / (self.gridN - 1))
-        self.rho = None
-
-    @staticmethod
-    def _gaussian_2d(P, mu, Sigma):
-        d = P - mu
-        Sinv = np.linalg.inv(Sigma)
-        expo = np.einsum('...i,ij,...j->...', d, Sinv, d)
-        det = np.linalg.det(Sigma)
-        coef = 1.0 / (2.0 * np.pi * np.sqrt(det))
-        return coef * np.exp(-0.5 * expo)
-
-    @staticmethod
-    def rotated_cov(sig1, sig2, theta_rad):
-        c, s = np.cos(theta_rad), np.sin(theta_rad)
-        R = np.array([[c, -s], [s, c]])
-        return R @ np.diag([sig1**2, sig2**2]) @ R.T
-
-    def build(self, centers, covs, weights):
-        if len(centers) != len(covs) or len(centers) != len(weights):
-            raise ValueError("centers, covs, and weights must have equal length.")
-        w = np.asarray(weights, dtype=float)
-        if np.any(w < 0):
-            raise ValueError("weights must be nonnegative.")
-        w = w / (w.sum() + 1e-16)
-
-        mix = np.zeros(self.P.shape[:2], dtype=float)
-        for mu, Sigma, a in zip(centers, covs, w):
-            mix += a * self._gaussian_2d(self.P, np.array(mu), np.array(Sigma))
-
-        mix /= (mix.sum() * self.dxdy + 1e-16)
-        self.rho = mix
-        return self.rho
-
-    def phi_coeffs(self, basis: FourierBasis):
-        if self.rho is None:
-            raise RuntimeError("Call build(...) first to create rho.")
-        phi = np.zeros(basis.nK, dtype=float)
-        for i, (kx, ky) in enumerate(basis.modes):
-            phi[i] = np.sum(self.rho *
-                            np.cos(np.pi * kx * self.X / basis.L[0]) *
-                            np.cos(np.pi * ky * self.Y / basis.L[1])) * self.dxdy
-        return phi
-
-
-# -------------------- Multi-robot Ergodic CLF Controller --------------------
-class MultiRobotErgodicCLF:
+class MultiAgentErgodicDecentralized:
     """
-    Decentralized CLF-only controller using an Augmented Lagrangian for the CLF row:
-        g(z) = gradE^T u - delta - rhs_clf <= 0,  rhs_clf = -alpha*c_clf*E
-    Input bounds are kept as variable bounds: |u_i| <= u_max, delta >= 0.
+    Decentralized N-agent ergodic controller on [0,Lx]x[0,Ly] with:
+      • hk-normalized cosine basis
+      • Per-agent CLF (always on) and optional High-Order CBF (relative-degree 2 on h=-E)
+      • Each agent solves its OWN QP using only global scalars (c, E, dotE, beta) and its local gradient A_i
+
+    Decision per agent i: z_i = [u_ix, u_iy, xi_i]
+    Cost per agent: 0.5*||u_i||^2 + w_xi * xi_i^2
+
+    If include_cbf=True:
+      CLF   : A_i^T u_i - xi_i <= (-c_clf * E) / N
+      HOCBF : A_i^T u_i - xi_i <= (beta + (k1+k2)*dotE + k1*k2*E) / N
+    Else:
+      CLF   : A_i^T u_i - xi_i <= (-c_clf * E) / N
     """
-    def __init__(self, 
-                 basis: FourierBasis, phi, u_max=1.0, w_clf=10.0, c_clf=0.5, alphas=None,
-                 al_rho=10.0, al_iters=5):
-        self.basis = basis
-        self.phi = np.asarray(phi, dtype=float)
+
+    def __init__(
+        self,
+        L=(1.0, 1.0),
+        num_k_per_dim=10,
+        num_cell=100,
+        gmm_params=None,
+        dt=0.05,
+        T_steps=1200,
+        u_max=0.1,
+        w_xi=1000.0,
+        c_clf=1.2,
+        k1=2.0,
+        k2=2.0,
+        include_cbf=True,
+        N_agents=4,
+        x0=None,
+        seed=7
+    ):
+        rng = np.random.default_rng(seed)
+        self.L = np.array(L, dtype=float)
+        self.dt = float(dt)
+        self.T_steps = int(T_steps)
         self.u_max = float(u_max)
-        self.w_clf = float(w_clf)
+        self.w_xi = float(w_xi)
         self.c_clf = float(c_clf)
-        self.c = np.zeros_like(self.phi)    # running average Fourier coeffs
-        self.t_now = 1e-2                   # avoid div-by-zero at start
-        self.alphas = None if alphas is None else np.asarray(alphas, dtype=float)
+        self.k1 = float(k1)
+        self.k2 = float(k2)
+        self.include_cbf = bool(include_cbf)
 
-        # Augmented Lagrangian hyperparameters
-        self.al_rho0 = float(al_rho)
-        self.al_iters = int(al_iters)
+        self.ks = self._build_modes(num_k_per_dim)
+        self.K = self.ks.shape[0]
+        self.gx, self.gy, self.grid, self.dxdy = self._build_grid(num_cell)
 
-    def ergodic_metric(self):
-        return float(np.sum(self.basis.Lam * (self.c - self.phi) ** 2))
+        self.hk, self.Fk_grid = self._build_hk_basis()
 
-    def gradE_at(self, x, N_agents):
-        gradF = self.basis.gradF_mat(x)         # (nK, 2)
-        weights = self.basis.Lam * (self.c - self.phi)  # (nK,)
-        return (2.0 / (self.t_now * N_agents)) * (weights @ gradF)  # (2,)
+        if gmm_params is None:
+            gmm_params = self._default_gmm()
+        self.phi, self.pdf_gt_img = self._project_target_to_phi(gmm_params)
+        self.pdf_recon_img = self._reconstruct_from_phi()
 
-    # -------------- Augmented Lagrangian local solver (per robot) --------------
-    def local_qp(self, gradE_j, E, alpha_j):
-        """
-        Solve (with AL):
-            min 0.5||u||^2 + w_clf*delta^2
-            s.t. g(z) = gradE_j^T u - delta - rhs_clf <= 0
-                 |u_i| <= u_max, delta >= 0
-        """
-        rhs_clf = -alpha_j * self.c_clf * E
+        self.Lam = np.array([self._sobolev_weight(k[0], k[1]) for k in self.ks])
 
-        # decision z = [u_x, u_y, delta]
+        self.N = int(N_agents)
+        if x0 is None:
+            self.x = rng.uniform(low=0.1, high=0.9, size=(self.N, 2))
+        else:
+            x0 = np.asarray(x0, dtype=float)
+            assert x0.shape == (self.N, 2)
+            self.x = x0.copy()
+
+        self.c = np.zeros(self.K, dtype=float)
+
+        self.lam1 = np.zeros(self.N)
+        self.lam2 = np.zeros(self.N)
+
+        self.traj = [self.x.copy()]
+        self.E_hist = []
+        self.dotE_hist = []
+
+        self.t_now = 1e-2
+
+    @staticmethod
+    def _default_gmm():
+        mean1 = np.array([0.35, 0.38])
+        cov1  = np.array([[0.01, 0.004],[0.004, 0.01]])
+        w1    = 0.5
+        mean2 = np.array([0.68, 0.25])
+        cov2  = np.array([[0.005, -0.003],[-0.003, 0.005]])
+        w2    = 0.2
+        mean3 = np.array([0.56, 0.64])
+        cov3  = np.array([[0.008, 0.0],[0.0, 0.004]])
+        w3    = 0.3
+        return [(w1, mean1, cov1), (w2, mean2, cov2), (w3, mean3, cov3)]
+
+    def _build_modes(self, num_k_per_dim):
+        kx, ky = np.meshgrid(np.arange(num_k_per_dim),
+                             np.arange(num_k_per_dim),
+                             indexing="xy")
+        return np.stack([kx.ravel(), ky.ravel()], axis=1)
+
+    def _build_grid(self, num_cell):
+        gx, gy = np.meshgrid(np.linspace(0, self.L[0], num_cell),
+                             np.linspace(0, self.L[1], num_cell),
+                             indexing="xy")
+        grid = np.stack([gx.ravel(), gy.ravel()], axis=1)
+        dx = self.L[0] / (num_cell - 1)
+        dy = self.L[1] / (num_cell - 1)
+        dxdy = dx * dy
+        return gx, gy, grid, dxdy
+
+    def _build_hk_basis(self):
+        K = self.ks.shape[0]
+        Fk_grid = np.zeros((K, self.grid.shape[0]), dtype=float)
+        hk = np.zeros(K, dtype=float)
+        for i, k in enumerate(self.ks):
+            fk_raw = np.prod(np.cos(np.pi * k / self.L * self.grid), axis=1)
+            hk[i] = np.sqrt(np.sum(fk_raw**2) * self.dxdy)
+            Fk_grid[i, :] = fk_raw / hk[i]
+        return hk, Fk_grid
+
+    def _gmm_pdf_vals(self, gmm_params):
+        vals = 0.0
+        for (w, m, C) in gmm_params:
+            vals += w * mvn.pdf(self.grid, mean=m, cov=C)
+        mass = np.sum(vals) * self.dxdy
+        return vals / mass
+
+    def _project_target_to_phi(self, gmm_params):
+        rho = self._gmm_pdf_vals(gmm_params)
+        phi = (self.Fk_grid @ rho) * self.dxdy
+        return phi, rho.reshape(self.gx.shape)
+
+    def _reconstruct_from_phi(self):
+        recon = (self.phi @ self.Fk_grid)
+        recon = np.maximum(recon, 0.0)
+        s = np.sum(recon) * self.dxdy
+        if s > 0:
+            recon /= s
+        return recon.reshape(self.gx.shape)
+
+    @staticmethod
+    def _sobolev_weight(kx, ky, n=2):
+        return 1.0 / (1.0 + kx*kx + ky*ky)**((n + 1)/2.0)
+
+    def F_stack(self, x):
+        cx = np.cos(np.pi * self.ks[:, 0] * x[0] / self.L[0])
+        cy = np.cos(np.pi * self.ks[:, 1] * x[1] / self.L[1])
+        fk_raw = cx * cy
+        return fk_raw / self.hk
+
+    def gradF_stack(self, x):
+        kx = self.ks[:, 0]; ky = self.ks[:, 1]
+        ax = np.pi * kx / self.L[0]; ay = np.pi * ky / self.L[1]
+        cosx, cosy = np.cos(ax * x[0]), np.cos(ay * x[1])
+        sinx, siny = np.sin(ax * x[0]), np.sin(ay * x[1])
+        dcosx = -ax * sinx
+        dcosy = -ay * siny
+        gx = (dcosx * cosy) / self.hk
+        gy = (cosx * dcosy) / self.hk
+        return np.stack([gx, gy], axis=1)
+
+    def _global_quantities(self):
+        F_each = np.array([self.F_stack(self.x[i]) for i in range(self.N)])
+        F_bar  = np.mean(F_each, axis=0)
+        E      = np.sum(self.Lam * (self.c - self.phi)**2)
+
+        dotc   = (F_bar - self.c) / self.t_now
+        dotE   = 2.0 * np.sum(self.Lam * (self.c - self.phi) * dotc)
+
+        A_list = []
+        for i in range(self.N):
+            G_i = self.gradF_stack(self.x[i])
+            A_i = (2.0 / self.t_now) * (self.Lam * (self.c - self.phi)) @ G_i
+            A_list.append(A_i)
+        A_list = np.array(A_list)
+
+        beta = 2.0 * np.sum(
+            self.Lam * (
+                dotc**2
+                + (self.c - self.phi) * (-(1.0/self.t_now)*dotc - (1.0/(self.t_now*self.t_now))*(F_bar - self.c))
+            )
+        )
+
+        return F_bar, E, dotE, beta, A_list
+
+    def _agent_qp(self, i, E, dotE, beta, A_i):
+        rhs_clf_i = (-self.c_clf * E) / self.N
+        if self.include_cbf:
+            rhs_cbf_i = (beta + (self.k1 + self.k2)*dotE + (self.k1*self.k2)*E) / self.N
+
+        gE_i = A_i.copy()
+
+        def f_cost(z):
+            u = z[:2]; xi = z[2]
+            return 0.5*np.dot(u, u) + self.w_xi*(xi**2)
+
+        def g1(z):
+            u = z[:2]; xi = z[2]
+            return float(np.dot(gE_i, u) - xi - rhs_clf_i)
+
+        if self.include_cbf:
+            def g2(z):
+                u = z[:2]; xi = z[2]
+                return float(np.dot(A_i, u) - xi - rhs_cbf_i)
+        else:
+            def g2(z):
+                return -1.0
+
+        def Phi(z, lam1, lam2):
+            r1 = g1(z)
+            r2 = g2(z)
+            val = f_cost(z) + lam1*r1 + 0.5*r1**2
+            if self.include_cbf:
+                val += lam2*r2 + 0.5*max(0.0, r2)**2
+            return val
+
         bnds = Bounds(lb=[-self.u_max, -self.u_max, 0.0],
                       ub=[ self.u_max,  self.u_max, np.inf])
-        
-        def f_cost(z):
-            u = z[:2]; d = z[2]
-            return 0.5 * np.dot(u, u) + self.w_clf * (d ** 2)
 
-        def g_ineq(z):
-            u = z[:2]; d = z[2]
-            return float(np.dot(gradE_j, u) - d - rhs_clf)  # <= 0 desired
+        res = minimize(lambda z: Phi(z, self.lam1[i], self.lam2[i]),
+                       x0=np.zeros(3), method="SLSQP", bounds=bnds)
+        z = np.zeros(3) if not res.success else res.x
 
-        # PHR AL objective
-        def Phi(z, lam, rho):
-            g = g_ineq(z)
-            return f_cost(z) + lam * g + 0.5 * g ** 2
+        u = z[:2]; xi = z[2]
+        print(res.x)
 
-        # AL outer loop
-        z = np.zeros(3)  # start at 0
-        lam = 0.0
-        rho = self.al_rho0
+        r1 = max(0.0, g1(z))
+        self.lam1[i] = max(0.0, self.lam1[i] + 1.0*r1)
+        if self.include_cbf:
+            r2 = max(0.0, g2(z))
+            self.lam2[i] = max(0.0, self.lam2[i] + 1.0*r2)
 
-        for _ in range(self.al_iters):
-            # inner solve
-            fun = lambda zz: Phi(zz, lam, rho)
-            res = minimize(fun, z, method='SLSQP', bounds=bnds)
-            z = res.x if res.success else z
+        return u, xi
 
-            print(z)
+    def step(self):
+        F_bar, E, dotE, beta, A_list = self._global_quantities()
 
-            # dual update
-            g = g_ineq(z)
-            lam = max(0.0, lam + rho * g)
+        U = np.zeros_like(self.x)
+        for i in range(self.N):
+            U[i], _ = self._agent_qp(i, E, dotE, beta, A_list[i])
+            n = np.linalg.norm(U[i])
+            if n > 0.05:
+                U[i] = (U[i]/n) * 0.05
 
-            # (optional) adapt rho if violation persists
-            if g > 1e-3:
-                rho *= 2.0
+        self.x = self.x + self.dt * U
+        self.x = np.minimum(np.maximum(self.x, 0.0), self.L)
 
-        u = z[:2]
-        delta = z[2]
-        return u, delta
+        F_each_new = np.array([self.F_stack(self.x[i]) for i in range(self.N)])
+        F_bar_new  = np.mean(F_each_new, axis=0)
+        self.c     = self.c + self.dt * ((F_bar_new - self.c) / self.t_now)
 
-    def step(self, X):
-        """
-        One decentralized control step for all robots.
-        X: array (N,2) current positions
-        Returns:
-            U: array (N,2) controls
-            E: ergodic metric
-            F_avg: vector (nK,) average Fourier evaluations
-        """
-        N = X.shape[0]
-        if self.alphas is None:
-            alphas = np.ones(N) / N
-        else:
-            alphas = self.alphas / (np.sum(self.alphas) + 1e-16)
-        
-        # LOCAL evaluations → low-bandwidth average
-        F_list = np.stack([self.basis.F_vec(x) for x in X])  # (N, nK)
-        F_avg = F_list.mean(axis=0)
-
-        # Shared running-average update
-        self.c = self.c + self.dt * ((F_avg - self.c) / self.t_now)
-
-        # Local AL solves
-        E = self.ergodic_metric()
-
-        U = np.zeros_like(X)
-        for j in range(N):
-            gE_j = self.gradE_at(X[j], N)
-            U[j], _ = self.local_qp(gE_j, E, alphas[j])
-
-        # Advance time
         self.t_now += self.dt
-        return U, E, F_avg
+        self.traj.append(self.x.copy())
+        self.E_hist.append(E)
+        self.dotE_hist.append(dotE)
 
-    def set_dt(self, dt):
-        self.dt = float(dt)
+    def run(self, show_live=True, plot_every=5):
+        if show_live:
+            fig, ax = plt.subplots(figsize=(6, 6), dpi=140)
+            ax.imshow(self.pdf_recon_img, origin="lower",
+                      extent=[0, self.L[0], 0, self.L[1]], interpolation="bilinear")
+            title = "Decentralized N-Agent Ergodic Control (CLF{}{})".format(
+                " + " if self.include_cbf else "",
+                "HOCBF" if self.include_cbf else ""
+            )
+            ax.set_title(title)
+            cb = plt.colorbar(ax.images[0], ax=ax)
+            cb.set_label("Reconstructed ρ(x)")
+            ax.set_xlabel("x"); ax.set_ylabel("y")
+            lines = [ax.plot([], [], '-', lw=2)[0] for _ in range(self.N)]
+            pts   = ax.scatter([], [], s=36)
+            ax.set_xlim(0, self.L[0]); ax.set_ylim(0, self.L[1])
+            ax.set_aspect('equal', adjustable='box')
+            fig.tight_layout()
+            plt.pause(0.1)
 
+        for k in range(self.T_steps):
+            self.step()
+            if show_live and (k % plot_every == 0):
+                arr = np.array(self.traj)  # (steps+1, N, 2)
+                for i in range(self.N):
+                    path = arr[:, i, :]
+                    lines[i].set_data(path[:, 0], path[:, 1])
+                pts.set_offsets(self.x)
+                plt.pause(0.001)
 
-# -------------------- Example usage / full control loop --------------------
+        if show_live:
+            plt.show()
+
+    def plot_pdf_side_by_side(self, means=None):
+        vmin = 0.0
+        vmax = max(self.pdf_gt_img.max(), self.pdf_recon_img.max())
+        fig, axes = plt.subplots(1, 2, figsize=(10, 5), dpi=130, constrained_layout=True)
+
+        ax = axes[0]
+        im0 = ax.imshow(self.pdf_gt_img, origin="lower",
+                        extent=[0, self.L[0], 0, self.L[1]],
+                        interpolation="bilinear", vmin=vmin, vmax=vmax, cmap="Reds")
+        ax.set_title("Ground Truth PDF")
+        ax.set_aspect("equal"); ax.set_xlabel("x"); ax.set_ylabel("y")
+        plt.colorbar(im0, ax=ax, fraction=0.046, pad=0.04, label="density")
+        if means is not None:
+            ax.scatter([m[0] for m in means], [m[1] for m in means], c="k", s=30, marker="x")
+
+        ax = axes[1]
+        im1 = ax.imshow(self.pdf_recon_img, origin="lower",
+                        extent=[0, self.L[0], 0, self.L[1]],
+                        interpolation="bilinear", vmin=vmin, vmax=vmax, cmap="Blues")
+        ax.set_title("Reconstructed PDF from φ_k (hk-normalized)")
+        ax.set_aspect("equal"); ax.set_xlabel("x"); ax.set_ylabel("y")
+        plt.colorbar(im1, ax=ax, fraction=0.046, pad=0.04, label="density")
+        if means is not None:
+            ax.scatter([m[0] for m in means], [m[1] for m in means], c="k", s=30, marker="x")
+
+        plt.show()
+
+    def plot_metrics(self):
+        tt = np.arange(len(self.E_hist)) * self.dt
+        fig, ax = plt.subplots(2, 1, figsize=(6, 5), dpi=140, constrained_layout=True)
+        ax[0].plot(tt, self.E_hist, lw=2); ax[0].set_ylabel("E"); ax[0].set_title("Ergodic Metric")
+        ax[1].plot(tt, self.dotE_hist, lw=2); ax[1].set_ylabel("dE/dt"); ax[1].set_xlabel("time"); ax[1].set_title("dE/dt")
+        plt.show()
+
 if __name__ == "__main__":
-    # Domain and basis
-    L = np.array([1.0, 1.0])
-    Kmax = (4, 4)
-    basis = FourierBasis(L=L, Kmax=Kmax)
-
-    # Build a target Gaussian Mixture rho and its Fourier coefficients phi
-    gmm = GaussianMixtureDensity(L=L, gridN=201)
-    centers = [[0.25, 0.70], [0.75, 0.30]]
-    covs = [
-        [[0.02, 0.0], [0.0, 0.02]],
-        [[0.02, 0.0], [0.0, 0.02]],
+    gmm = [
+        (0.5, np.array([0.35, 0.38]), np.array([[0.05, 0.004],[0.004, 0.01]])),
+        # (0.2, np.array([0.68, 0.25]), np.array([[0.005, -0.003],[-0.003, 0.005]])),
+        (0.5, np.array([0.56, 0.64]), np.array([[0.008, 0.0],[0.0, 0.004]])),
     ]
-    weights = [0.5, 0.5]
-    rho = gmm.build(centers, covs, weights)
-    phi = gmm.phi_coeffs(basis)
 
-    # Controller
-    N = 1
-    dt = 0.1
-    T_steps = 10
-    u_max = 1.0
-    w_clf = 20.0
-    c_clf = 10.0
-    alphas = np.ones(N) / N
+    ctrl = MultiAgentErgodicDecentralized(
+        L=(1.0, 1.0),
+        num_k_per_dim=10,
+        num_cell=100,
+        gmm_params=gmm,
+        dt=0.1,
+        T_steps=1200,
+        u_max=0.8,
+        w_xi=1000.0,
+        c_clf=1.0,
+        k1=2.0, k2=2.0,
+        include_cbf=False,
+        N_agents=1,
+        x0=None,
+        seed=7
+    )
 
-    ctrl = MultiRobotErgodicCLF(basis, phi, u_max=u_max, w_clf=w_clf, c_clf=c_clf, alphas=alphas,
-                                al_rho=100.0, al_iters=1)
-    ctrl.set_dt(dt)
-
-    # Initial states
-    rng = np.random.default_rng(2)
-    # X = rng.uniform(low=[0.1, 0.1], high=[0.9, 0.9], size=(N, 2))
-    X = np.array([[0.1,0.1]])
-
-    # Logging
-    traj = [X.copy()]
-    E_hist = []
-
-    # Live plotting
-    plt.ion()
-    fig, ax = plt.subplots(figsize=(6.8, 6.4), dpi=140)
-    im = ax.imshow(rho.T, origin="lower", extent=[0, L[0], 0, L[1]], interpolation="bilinear")
-    paths = [ax.plot([], [], lw=1.8, label=f"r{j+1}")[0] for j in range(N)]
-    pts = ax.plot(X[:, 0], X[:, 1], 'o', ms=6)[0]
-    ax.set_xlim(0, L[0]); ax.set_ylim(0, L[1]); ax.set_aspect('equal', adjustable='box')
-    cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    cbar.set_label("ρ(x)")
-    ttl = ax.set_title("N-robot Ergodic CLF-only (AL)   step 0/{}   E=0.0".format(T_steps))
-    ax.set_xlabel("x"); ax.set_ylabel("y")
-    ax.legend(loc="upper right", ncols=2, fontsize=8)
-
-    # Simulate
-    for k in range(T_steps):
-        U, E, F_avg = ctrl.step(X)
-        # print(U)
-        X = X + dt * U
-        X = np.minimum(np.maximum(X, 0.0), L)
-
-        traj.append(X.copy())
-        E_hist.append(E)
-
-        arr = np.stack(traj, axis=0)
-        for j in range(N):
-            paths[j].set_data(arr[:, j, 0], arr[:, j, 1])
-        pts.set_data(X[:, 0], X[:, 1])
-        ttl.set_text(f"N-robot Ergodic CLF-only (AL)   step {k+1}/{T_steps}   E={E:.3e}")
-        plt.pause(0.001)
-
-    # plt.ioff()
-    # plt.show()
+    ctrl.run(show_live=True, plot_every=5)
+    # ctrl.plot_metrics()

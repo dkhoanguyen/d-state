@@ -39,19 +39,6 @@ class DSTATE(Allocator):
         self._reach_goal_objective = ReachGoalObjective()
         self._ergodic_coverage_objective = ErgodicCoverageObjective()
 
-        self._objective_dict = {}
-        for id, task in enumerate(tasks):
-            if task.task_type == TaskType.REACH_GOAL:
-                self._objective_dict[id] = ReachGoalObjective()
-            elif task.task_type == TaskType.EXPLORE:
-                pass
-            elif task.task_type == TaskType.HERDING:
-                pass
-
-        # Evaluator
-        self._reach_goal_evaluator = ReachGoalEvaluator()
-        # self._ergodic_coverage_evaluator = Ergod
-
         # Executor
         self._reach_goal_executor = ReachGoalExecutor()
         self._ergodic_coverage_executor = ErgodicCoverageExecutor()
@@ -83,7 +70,6 @@ class DSTATE(Allocator):
              agent: Agent,
              agents: List[Agent],
              scenario: Scenario,
-             evaluator: Evaluator,
              planning_budget: int
              ) -> List[Agent]:
         """
@@ -99,7 +85,6 @@ class DSTATE(Allocator):
             agent=agent,
             agents=agents,
             scenario=scenario,
-            evaluator=evaluator,
             temperature=T,
             max_iter=15,
             annealing_rate=0.0005,
@@ -138,7 +123,6 @@ class DSTATE(Allocator):
                    agent: Agent,
                    agents: List[Agent],
                    scenario: Scenario,
-                   evaluator: Evaluator,
                    temperature: float,
                    max_iter: int,
                    annealing_rate: float,
@@ -208,7 +192,7 @@ class DSTATE(Allocator):
 
         E_G = 0.0
         if scenario.tasks[task_id].task_type == TaskType.REACH_GOAL:
-            E_G = self._reach_goal_evaluator.calculate_reward(
+            E_G = self._reach_goal_executor.calculate_reward(
                 agent=agent,
                 task=scenario.tasks[task_id],
                 other_agents=agents,
@@ -229,7 +213,7 @@ class DSTATE(Allocator):
 
         E_G_x_i = 0.0
         if scenario.tasks[task_id].task_type == TaskType.REACH_GOAL:
-            E_G_x_i = self._reach_goal_evaluator.calculate_reward(
+            E_G_x_i = self._reach_goal_executor.calculate_reward(
                 agent=agent,
                 task=scenario.tasks[task_id],
                 other_agents=agents,
@@ -262,9 +246,9 @@ class DSTATE(Allocator):
         E_C_x = 0.0
         prob = 0.0
         if scenario.tasks[task_id].task_type == TaskType.REACH_GOAL:
-            prob = self._reach_goal_evaluator.preprocess(
+            prob = self._reach_goal_executor.preprocess(
                 joint_action=joint_actions)
-            E_C_x = self._reach_goal_evaluator.calculate_cost(
+            E_C_x = self._reach_goal_executor.calculate_cost(
                 agent=agent,
                 task=scenario.tasks[task_id],
                 other_agents=agents,
@@ -286,9 +270,9 @@ class DSTATE(Allocator):
         E_C_x_i = 0.0
         prob = 0.0
         if scenario.tasks[task_id].task_type == TaskType.REACH_GOAL:
-            prob = self._reach_goal_evaluator.preprocess(
+            prob = self._reach_goal_executor.preprocess(
                 joint_action=joint_actions)
-            E_C_x_i = self._reach_goal_evaluator.calculate_cost(
+            E_C_x_i = self._reach_goal_executor.calculate_cost(
                 agent=agent,
                 task=scenario.tasks[task_id],
                 other_agents=agents,
@@ -307,70 +291,8 @@ class DSTATE(Allocator):
             trajectory.append(x.copy())
         return trajectory
 
-    # def _update_progress(self, agent: Agent, scenario: Scenario, horizon: int):
-    #     task_id = agent.allocation[agent.id]
-    #     current_task: ReachGoalTask = scenario.tasks[task_id]
-    #     x0 = agent.state
-    #     x_g = current_task.location
-
-    #     u0 = (x_g - x0)
-    #     v_max = agent.u_bounds[0, 1]
-    #     if np.linalg.norm(u0) > v_max:
-    #         u0 = v_max * (u0 / np.linalg.norm(u0))
-    #     u0 = np.hstack((u0, 0.0))
-
-    #     u = np.tile(u0, horizon)
-    #     trajectory = self._simulate_trajectory(
-    #         model=agent.model,
-    #         x0=x0,
-    #         U=u,
-    #         N=horizon,
-    #     )
-
-    #     hypo_progress = []
-    #     for k in range(horizon):
-    #         x_k = trajectory[k]
-    #         progress_k = self._reach_goal_objective.progress(
-    #             model=agent.model,
-    #             x=x_k,
-    #             u=u0,
-    #             x_g=x_g,
-    #             dx_g_dt=np.zeros(2),
-    #             gamma=1.0,
-    #             r=0.1
-    #         )
-    #         hypo_progress.append(progress_k)
-
-    #     u0 = agent.control
-    #     u = np.tile(u0, horizon)
-    #     trajectory = self._simulate_trajectory(
-    #         model=agent.model,
-    #         x0=x0,
-    #         U=u,
-    #         N=horizon,
-    #     )
-
-    #     true_progress = []
-    #     for k in range(horizon):
-    #         x_k = trajectory[k]
-    #         progress_k = self._reach_goal_objective.progress(
-    #             model=agent.model,
-    #             x=x_k,
-    #             u=u0,
-    #             x_g=x_g,
-    #             dx_g_dt=np.zeros(2),
-    #             gamma=1.0,
-    #             r=0.1
-    #         )
-    #         true_progress.append(progress_k)
-
-    #     hypo_progress = np.diff(hypo_progress)
-    #     true_progress = np.diff(true_progress)
-
-    #     progress = np.maximum(np.minimum(np.abs(
-    #         true_progress[-1] - true_progress[0]) / np.abs(hypo_progress[-1] - hypo_progress[0]), 1.0), 0.0)
-    #     d_sigma = 0.05 * (1 - progress)
-    #     return agent
+    def _update_progress(self, agent: Agent, scenario: Scenario, horizon: int):
+        return agent
 
     def _plan_control_action(self, agent: Agent, agents: List[Agent], task_id: int, scenario: Scenario,horizon:int):
         if task_id < 0:

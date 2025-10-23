@@ -19,26 +19,28 @@ def main():
     full_comms = True
     # Run mission
     planning_budget = 10
-    max_iterations = 350
+    max_iterations = 1000
 
     comm_distance = 5
     agent_location_range = [0.1, 0.1]
 
     tasks = []
-    centers = [[0.25, 0.70],
-               [0.75, 0.30]]
+    centers = [[0.5, 0.70],
+               [0.5, 0.30]]
 
-    covs = [[[0.02, 0.0], [0.0, 0.02]],
-            [[0.02, 0.0], [0.0, 0.02]]]
+    covs = [
+        [[0.002, 0.0], [0.0, 0.002]],
+        [[0.002, 0.0], [0.0, 0.002]],
+    ]
     
     
     task = ErgodicCoverageTask()
     task.capabilities_required = 0
     task.t_init = 1e-2
-    task.c_clf = 10.0
-    task.w_clf = 20.0
-    task.A = 1
-    task.E_threshold = 1e-3
+    task.c_clf = 100
+    task.w_clf = 200.0
+    task.A = num_agents
+    task.E_threshold = 1e-10
     task.centers = centers
     task.covs = covs
     task.weights = [0.5,0.5]
@@ -56,7 +58,7 @@ def main():
         tasks=tasks,
         obstacles=None
     )
-    scenario.agent_locations = np.array([[0.1,0.1]])
+    scenario.agent_locations = np.array([[0.5,0.5],[0.9,0.9]])
     actions = generate_initial_action(scenario=scenario, deterministic=False)
     
     # Initialise agents
@@ -138,8 +140,11 @@ def main():
         for agent_id, agent in enumerate(agents):
             start_time = time.time()
             agents[agent_id] = allocator.plan(
-                agent, local_agents[agent_id], scenario, prob_evaluator, planning_budget)
+                agent, local_agents[agent_id], scenario, planning_budget)
             local_agents[agent_id][agent_id] = agents[agent_id]
+            # neighbour_ids = np.arange(num_agents)
+            # for neighbor_id in neighbour_ids:
+            #     local_agents[neighbor_id][agent_id] = deepcopy(agent)
 
             planning_time += time.time() - start_time
 
@@ -154,13 +159,13 @@ def main():
             X = np.vstack((X,local_agent.state))
 
         X = np.minimum(np.maximum(X, 0.0), np.array([1.0, 1.0]))
+        traj.append(X.copy())
         arr = np.stack(traj, axis=0)
+        
         for j in range(num_agents):
             paths[j].set_data(arr[:, j, 0], arr[:, j, 1])
         pts.set_data(X[:, 0], X[:, 1])
-        plt.pause(0.1)
-
-
+        plt.pause(0.01)
 
         consensus_step += 1
 
