@@ -3,38 +3,70 @@ import numpy as np
 from numpy.typing import NDArray
 from typing import List, Tuple, Callable, Optional
 from scipy.optimize import minimize, Bounds
+from scipy.stats import multivariate_normal as mvn
 
 from executor.executor import Executor
 from datatypes import *
 from evaluator import *               # optional, same as your example imports
 from model import Model
-from objective import Objective, FourierBasis, ErgodicCoverageObjective
+from objective import Objective
+
+
+@dataclass
+class BasisPack:
+    phi: np.ndarray      # (K,)
+    Lam: np.ndarray      # (K,)
+    ks: np.ndarray       # (K,2)
+    Fk_grid: np.ndarray  # (K, M)
+    dxdy: float
+    hk: np.ndarray       # (K,)
+    pdf_img: Optional[np.ndarray] = None
+    gx_shape: Optional[Tuple[int, int]] = None
+
+
+@dataclass
+class ErgodicParams:
+    L: np.ndarray                    # domain, shape (2,)
+    num_k_per_dim: int               # number of cosine modes per axis
+    num_cell: int                    # grid resolution per axis
+    c_clf: float = 1.0               # CLF gain
+    include_cbf: bool = False        # keep False unless you also pass k1,k2
+    # HOCBF params (used only if include_cbf=True)
+    k1: float = 2.0
+    k2: float = 2.0
+    w_xi: float = 1000.0             # slack cost
+    u_max: float = 0.1               # max control magnitude per axis
+    dt: float = 0.1                  # agent time step
+    # random drift for moving targets (0 = static)
+    drift_std: float = 0.0
+
 
 class ErgodicCoverageExecutor(Executor):
     """
     Decision per step z_k = [u (m_u dims), δ], bounds on u and δ.
     AL outer loop over horizon-wise CLF rows g_k(z_k) ≤ 0.
     """
-    def __init__(self, 
-                 w_effort: float = 0.5, 
-                 k_eps: float = 1e3, 
-                 al_iters: int = 1, 
-                 rho0: float = 10.0):
-        self.w_effort = float(w_effort)  # 0.5 * ||u||^2 multiplier
-        self.k_eps = float(k_eps)        # δ^2 penalty
-        self.al_iters = int(al_iters)    # outer AL iterations
-        self.rho0 = float(rho0)          # initial ρ
 
-        L=(1.0,1.0)
-        Kmax=(4,4)
-        self.basis = FourierBasis(L=np.array(L, dtype=float), Kmax=Kmax)
-        self._gmm = GaussianMixtureDensity(L=np.array(L, dtype=float), gridN=201)
+    def __init__(self,
+                 num_k_per_dim: int = 10,
+                 L: Tuple[float, float] = (1.0, 1.0),
+                 num_cell: int = 100,
+                 c_clf: float = 1.0,
+                 w_xi: float = 1000.0,
+                 u_sat: float = 0.05,      # matches the demo main
+                 t_init: float = 1e-2):
+        self._num_k_per_dim = int(10)
+        self._L = np.array(L, dtype=float)
+        self._num_cell = int(num_cell)
+        self._c_clf = float(c_clf)
+        self._w_xi = float(w_xi)
+        self._u_sat = float(u_sat)
 
-        self._init = False
-        self.t_now = 1e-2
-        self.c = None
+        # time-like state for coefficient dynamics
+        self.t_now = float(t_init)
 
-        self.rho = 1.0
+        # rng for optional target drift; initialized on first execute with scenario.seed if available
+        self._rng = None
 
     def init(self):
         pass
@@ -43,7 +75,7 @@ class ErgodicCoverageExecutor(Executor):
         self,
         agent: Agent,
         task: ReachGoalTask,
-        other_agents: list[Agent], 
+        other_agents: list[Agent],
         horizon: float,
         joint_actions: NDArray[np.float64]
     ) -> float:
@@ -65,78 +97,45 @@ class ErgodicCoverageExecutor(Executor):
                 other_agents: List[Agent],
                 scenario: Scenario,
                 task: ErgodicCoverageTask,
-                lambda_k: NDArray[np.float64],   # can pass zeros; will be updated here
-                objective: ErgodicCoverageObjective,
+                lambda_k: NDArray[np.float64],
                 horizon: int,
                 maxiter: int = 50,
                 ftol: float = 1e-4,
-                eps: float = 1e-6) -> Tuple[NDArray[np.float64], bool]:
+                eps: float = 1e-6) -> Tuple[Agent, NDArray[np.float64], bool]:
+        # Ergodic controller parameters
+        params = ErgodicParams(
+            L=self._L,
+            num_k_per_dim=10,
+            num_cell=100,
+            c_clf=1.0,
+            include_cbf=False,
+            w_xi=1000.0,
+            u_max=0.8,
+            dt=0.1,
+            drift_std=0.0   # set >0 to see a moving target over time
+        )
+        basis = ErgodicCoveragePreprocessor.preprocess_target(
+            task.centers, task.covs, task.weights, params, None)
 
-        U0 = np.tile(agent.control, horizon)
-        u_max = agent.u_bounds[0, 1]
-        u_min = agent.u_bounds[0, 0]
-        bnds = [(u_min, u_max)] * (2 * horizon) + \
-            [(-np.inf, np.inf)] * horizon
+        E, dotE, beta, A_i, dotc_i = self._build_metrics(
+            agent=agent, others=other_agents, basis=basis, t_now=self.t_now, L=params.L
+        )
+        u, new_lambda = self._solve_local_qp(
+            A_i=A_i, E=E, dotE=dotE, beta=beta,
+            goal_lambda=agent.goal_lambda,
+            N_total=len(other_agents), params=params
+        )
+        agent.goal_lambda = new_lambda
+        a_updated = self._update_local_c_and_state(
+            agent=agent, basis=basis, params=params, t_now=self.t_now,
+            u=u
+        )
+        agent.c = a_updated.c
+        agent.c_dot = a_updated.c_dot
+        # agent.state = a_updated.state
+        self.t_now += params.dt
+        return agent, u, True
 
-        constraints = []
-
-        self._gmm.build(task.centers, task.covs, task.weights)
-        self.phi = self._gmm.phi_coeffs(self.basis)
-
-        if task.alphas is None:
-            alphas = np.ones(len(other_agents)) / len(other_agents)
-        else:
-            alphas = task.alphas / (np.sum(task.alphas) + 1e-16)
-        # print(alphas)
-
-        # Aggregate all states
-        X = np.empty((0,2))
-        for local_agent in other_agents:
-            X = np.vstack((X,local_agent.state))
-
-        # LOCAL evaluations → low-bandwidth average
-        F_list = np.stack([self.basis.F_vec(x) for x in X])  # (N, nK)
-        F_avg = F_list.mean(axis=0)
-
-        # Shared running-average update
-        if self.c is None:
-            self.c = np.zeros_like(self.phi)
-        self.c = self.c + task.dt * ((F_avg - self.c) / self.t_now)
-
-        E = self.ergodic_metric()
-        gE_J = self.gradE_at(agent.state, len(other_agents))
-
-        print(np.linalg.norm(gE_J))
-
-        rhs_clf = -alphas[agent.id] * task.c_clf * E
-        u_max = 1.0
-        
-        def f_cost(z):
-            u = z[:2]; d = z[2]
-            return 0.5 * np.dot(u, u) + task.w_clf * (d ** 2)
-
-        def g_ineq(z):
-            u = z[:2]; d = z[2]
-            return float(np.dot(gE_J, u) - d - rhs_clf)  # <= 0 desired
-        
-        # PHR AL objective
-        def Phi(z, lam):
-            g = g_ineq(z)
-            return f_cost(z) + lam * g + 0.5 * g ** 2
-        
-        z = np.zeros(3)  # start at 0
-        lam = 0.0
-
-        fun = lambda zz: Phi(zz, lam)
-        res = minimize(fun, z, method='SLSQP', bounds=bnds)
-        z = res.x if res.success else z
-
-        g = g_ineq(z)
-        lam = max(0.0, lam + 1 * g)
-        self.t_now += task.dt
-
-        return z,res.success
-    
     def _compute_cost(self,
                       model: Model,
                       U: np.ndarray,
@@ -153,17 +152,8 @@ class ErgodicCoverageExecutor(Executor):
             # Control effort
             cost += 0.5 * np.linalg.norm(u)**2
 
-            # Ergodic metric 
+            # Ergodic metric
 
-
-    def ergodic_metric(self):
-        return float(np.sum(self.basis.Lam * (self.c - self.phi) ** 2))
-
-    def gradE_at(self, x, N_agents):
-        gradF = self.basis.gradF_mat(x)         # (nK, 2)
-        weights = self.basis.Lam * (self.c - self.phi)  # (nK,)
-        return (2.0 / (self.t_now * N_agents)) * (weights @ gradF)  # (2,)
-    
     def _simulate_trajectory(self,
                              model: Model,
                              x0: NDArray[np.float64],
@@ -178,7 +168,7 @@ class ErgodicCoverageExecutor(Executor):
             x = model.f(x, u, dt)
             trajectory.append(x.copy())
         return trajectory
-    
+
     def _poisson_binomial_distribution(self, probabilities: NDArray[np.float64]) -> float:
         """
         Compute the Poisson binomial distribution P(X = k) using FFT with correct ordering.
@@ -214,61 +204,258 @@ class ErgodicCoverageExecutor(Executor):
         probs = np.flip(probs)
 
         return probs
-    
+
     def preprocess(self,
                    joint_action: NDArray[np.float64]):
         prob = self._poisson_binomial_distribution(joint_action)
         return np.sum(prob)
-    
 
-class GaussianMixtureDensity:
-    def __init__(self, L, gridN=201):
-        self.L = np.asarray(L, dtype=float)
-        self.gridN = int(gridN)
-        xs = np.linspace(0, self.L[0], self.gridN)
-        ys = np.linspace(0, self.L[1], self.gridN)
-        self.X, self.Y = np.meshgrid(xs, ys, indexing='xy')
-        self.P = np.stack([self.X, self.Y], axis=-1)
-        self.dxdy = (self.L[0] / (self.gridN - 1)) * (self.L[1] / (self.gridN - 1))
-        self.rho = None
+    def _F_stack(
+        self,
+        x: NDArray[np.float64],
+        ks: NDArray[np.float64],
+        L: NDArray[np.float64],
+        hk: NDArray[np.float64]
+    ) -> NDArray[np.float64]:
+        cx = np.cos(np.pi * ks[:, 0] * x[0] / L[0])
+        cy = np.cos(np.pi * ks[:, 1] * x[1] / L[1])
+        fk_raw = cx * cy
+        return fk_raw / hk
+
+    def _gradF_stack(
+        self,
+        x: NDArray[np.float64],
+        ks: NDArray[np.float64],
+        L: NDArray[np.float64],
+        hk: NDArray[np.float64]
+    ) -> NDArray[np.float64]:
+        kx = ks[:, 0]
+        ky = ks[:, 1]
+        ax = np.pi * kx / L[0]
+        ay = np.pi * ky / L[1]
+        cosx, cosy = np.cos(ax * x[0]), np.cos(ay * x[1])
+        sinx, siny = np.sin(ax * x[0]), np.sin(ay * x[1])
+        dcosx = -ax * sinx
+        dcosy = -ay * siny
+        gx = (dcosx * cosy) / hk
+        gy = (cosx * dcosy) / hk
+        return np.stack([gx, gy], axis=1)
+
+    def _build_metrics(
+        self,
+        agent: Agent,
+        others: List[Agent],
+        basis: BasisPack,
+        t_now: float,
+        L: NDArray[np.float64]
+    ) -> Tuple[float, float, float, NDArray[np.float64], NDArray[np.float64]]:
+        """
+        Returns:
+        E, dotE, beta, A_i, dotc_i
+        """
+        K = basis.ks.shape[0]
+        c_local = agent.c if agent.c is not None else np.zeros(K, dtype=float)
+
+        # consensus on c (logical average of exchanged vectors)
+        c_stack = [c_local]
+        for ag in others:
+            if ag.id == agent.id:
+                continue
+            c_stack.append(
+                ag.c if ag.c is not None else np.zeros(K, dtype=float))
+        mean_c = np.mean(np.vstack(c_stack), axis=0)
+
+        resid = (mean_c - basis.phi)
+        E = np.sum(basis.Lam * resid**2)
+
+        F_i = self._F_stack(agent.state, basis.ks, L=L, hk=basis.hk)
+        G_i = self._gradF_stack(agent.state, basis.ks, L=L, hk=basis.hk)
+        A_i = (2.0 / max(t_now, 1e-6)) * (basis.Lam * resid) @ G_i
+
+        # local dot c (only local info)
+        dotc_i = (F_i - c_local) / max(t_now, 1e-6)
+
+        # gather others' dotc if they publish; fallback to their own estimate
+        dotc_list = [dotc_i]
+        for ag in others:
+            if ag.id == agent.id:
+                continue
+            if ag.c_dot is not None:
+                dotc_list.append(ag.c_dot)
+            else:
+                # conservative fallback from their current state & c
+                c_other = ag.c if ag.c is not None else np.zeros(
+                    K, dtype=float)
+                F_other = F_stack(ag.state, basis.ks, L=L, hk=basis.hk)
+                dotc_list.append((F_other - c_other) / max(t_now, 1e-6))
+
+        dotc = np.mean(np.vstack(dotc_list), axis=0)
+        dotE = 2.0 * np.sum(basis.Lam * resid * dotc)
+        beta = 2.0 * np.sum(
+            basis.Lam * (
+                dotc**2 + resid * (-(1.0/max(t_now, 1e-6))*dotc -
+                                   (1.0/(max(t_now, 1e-6)**2))*(max(t_now, 1e-6)*dotc))
+            )
+        )
+        return E, dotE, beta, A_i, dotc_i
+
+    def _solve_local_qp(
+        self,
+        A_i: np.ndarray,
+        E: float,
+        dotE: float,
+        beta: float,
+        goal_lambda: float,
+        N_total: int,
+        params: ErgodicParams
+    ) -> Tuple[np.ndarray, float]:
+        """
+        Returns:
+        u (2,), goal_lambda_new
+        """
+        rhs_clf = (-params.c_clf * E) / max(N_total, 1)
+        gE_i = A_i.copy()
+
+        def f_cost(z):
+            u = z[:2]
+            xi = z[2]
+            return 0.5*np.dot(u, u) + 100*(xi**2)
+
+        def g1(z):
+            u = z[:2]
+            xi = z[2]
+            return float(np.dot(gE_i, u) - xi - rhs_clf)
+
+        def Phi(z, lam1):
+            r1 = g1(z)
+            return f_cost(z) + lam1*r1 + 0.5*r1**2
+
+        bnds = Bounds(lb=[-10000, -10000, 0.0],
+                      ub=[10000,  10000, np.inf])
+
+        res = minimize(lambda z: Phi(z, goal_lambda),
+                       x0=np.zeros(3), method="SLSQP", bounds=bnds)
+        z = np.zeros(3) if not res.success else res.x
+        u = z[:2]
+        n = np.linalg.norm(u)
+        if n > 0.1:
+            u = (u/n) * 0.1
+
+        # dual update
+        r1 = max(0.0, g1(z))
+        goal_lambda_new = max(0.0, goal_lambda + 1.0*r1)
+        return u, goal_lambda_new
+
+    def _update_local_c_and_state(
+        self,
+        agent: Agent,
+        basis: BasisPack,
+        params: ErgodicParams,
+        t_now: float,
+        u: np.ndarray
+    ) -> Agent:
+        """
+        Integrate state and update local coefficient vector using ONLY local quantities.
+        Returns updated Agent (copy).
+        """
+        K = basis.ks.shape[0]
+        new_state = agent.model.f(agent.state, u, params.dt)
+        # clamp to domain
+        new_state = np.minimum(np.maximum(new_state, 0.0), params.L)
+        # agent.state = new_state
+        if agent.c is None:
+            agent.c = np.zeros(K, dtype=float)
+        # local F_i and coefficient dynamics
+        F_i_new = self._F_stack(agent.state, basis.ks, params.L, basis.hk)
+        agent.c = agent.c + params.dt * \
+            ((F_i_new - agent.c) / max(t_now, 1e-6))
+        agent.c_dot = (F_i_new - agent.c) / max(t_now, 1e-6)
+
+        return agent
+
+
+class ErgodicCoveragePreprocessor:
+    @staticmethod
+    def build_modes(num_k_per_dim: int) -> np.ndarray:
+        kx, ky = np.meshgrid(np.arange(num_k_per_dim),
+                             np.arange(num_k_per_dim), indexing="xy")
+        return np.stack([kx.ravel(), ky.ravel()], axis=1)
 
     @staticmethod
-    def _gaussian_2d(P, mu, Sigma):
-        d = P - mu
-        Sinv = np.linalg.inv(Sigma)
-        expo = np.einsum('...i,ij,...j->...', d, Sinv, d)
-        det = np.linalg.det(Sigma)
-        coef = 1.0 / (2.0 * np.pi * np.sqrt(det))
-        return coef * np.exp(-0.5 * expo)
+    def build_grid(num_cell: int, L: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+        gx, gy = np.meshgrid(np.linspace(0, L[0], num_cell),
+                             np.linspace(0, L[1], num_cell), indexing="xy")
+        grid = np.stack([gx.ravel(), gy.ravel()], axis=1)
+        dx = L[0] / (num_cell - 1)
+        dy = L[1] / (num_cell - 1)
+        return gx, gy, grid, dx * dy
 
     @staticmethod
-    def rotated_cov(sig1, sig2, theta_rad):
-        c, s = np.cos(theta_rad), np.sin(theta_rad)
-        R = np.array([[c, -s], [s, c]])
-        return R @ np.diag([sig1**2, sig2**2]) @ R.T
+    def build_hk_basis(ks: np.ndarray, grid: np.ndarray, dxdy: float, L: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        K = ks.shape[0]
+        Fk_grid = np.zeros((K, grid.shape[0]), dtype=float)
+        hk = np.zeros(K, dtype=float)
+        for i, k in enumerate(ks):
+            fk_raw = np.prod(np.cos(np.pi * k / L * grid), axis=1)
+            hk[i] = np.sqrt(np.sum(fk_raw**2) * dxdy)
+            Fk_grid[i, :] = fk_raw / hk[i]
+        return hk, Fk_grid
 
-    def build(self, centers, covs, weights):
-        if len(centers) != len(covs) or len(centers) != len(weights):
-            raise ValueError("centers, covs, and weights must have equal length.")
-        w = np.asarray(weights, dtype=float)
-        if np.any(w < 0):
-            raise ValueError("weights must be nonnegative.")
-        w = w / (w.sum() + 1e-16)
+    @staticmethod
+    def sobolev_weight(kx: int, ky: int, n: int = 2) -> float:
+        return 1.0 / (1.0 + kx*kx + ky*ky)**((n + 1)/2.0)
 
-        mix = np.zeros(self.P.shape[:2], dtype=float)
-        for mu, Sigma, a in zip(centers, covs, w):
-            mix += a * self._gaussian_2d(self.P, np.array(mu), np.array(Sigma))
+    @staticmethod
+    def gmm_pdf_vals(grid: np.ndarray,
+                     dxdy: float,
+                     gmm_params: List[Tuple[float, np.ndarray, np.ndarray]]) -> np.ndarray:
+        vals = 0.0
+        for (w, m, C) in gmm_params:
+            vals += w * mvn.pdf(grid, mean=m, cov=C)
+        mass = np.sum(vals) * dxdy
+        return vals / mass
 
-        mix /= (mix.sum() * self.dxdy + 1e-16)  # normalize to integrate to 1
-        self.rho = mix
-        return self.rho
+    @staticmethod
+    def project_target_to_phi(Fk_grid: np.ndarray,
+                              grid: np.ndarray,
+                              gmm_params: List[Tuple[float, np.ndarray, np.ndarray]],
+                              dxdy: float) -> Tuple[np.ndarray, np.ndarray]:
+        rho = ErgodicCoveragePreprocessor.gmm_pdf_vals(grid, dxdy, gmm_params)
+        phi = (Fk_grid @ rho) * dxdy
+        return phi, rho
 
-    def phi_coeffs(self, basis: FourierBasis):
-        if self.rho is None:
-            raise RuntimeError("Call build(...) first to create rho.")
-        phi = np.zeros(basis.nK, dtype=float)
-        for i, (kx, ky) in enumerate(basis.modes):
-            phi[i] = np.sum(self.rho *
-                            np.cos(np.pi * kx * self.X / basis.L[0]) *
-                            np.cos(np.pi * ky * self.Y / basis.L[1])) * self.dxdy
-        return phi
+    @staticmethod
+    def reconstruct_from_phi(phi: np.ndarray, Fk_grid: np.ndarray, dxdy: float, gx_shape: Tuple[int, int]) -> np.ndarray:
+        recon = (phi @ Fk_grid)
+        recon = np.maximum(recon, 0.0)
+        s = np.sum(recon) * dxdy
+        if s > 0:
+            recon /= s
+        return recon.reshape(gx_shape)
+
+    @staticmethod
+    def preprocess_target(centers: np.ndarray,
+                          covs: np.ndarray,
+                          weights: np.ndarray,
+                          params: ErgodicParams,
+                          rng: Optional[np.random.Generator] = None) -> BasisPack:
+        # Optionally drift means a bit to simulate time-varying target
+        gmm_params = []
+        for w, m, C in zip(weights, centers, covs):
+            m = np.array(m, dtype=float)
+            if rng is not None and params.drift_std > 0:
+                m = np.clip(m + rng.normal(0.0, params.drift_std, size=2),
+                            a_min=[0.0, 0.0], a_max=params.L)
+            gmm_params.append((float(w), m, np.array(C, dtype=float)))
+
+        ks = ErgodicCoveragePreprocessor.build_modes(params.num_k_per_dim)
+        gx, gy, grid, dxdy = ErgodicCoveragePreprocessor.build_grid(
+            params.num_cell, params.L)
+        hk, Fk_grid = ErgodicCoveragePreprocessor.build_hk_basis(
+            ks, grid, dxdy, params.L)
+        phi, rho_flat = ErgodicCoveragePreprocessor.project_target_to_phi(
+            Fk_grid, grid, gmm_params, dxdy)
+        pdf_img = rho_flat.reshape(gx.shape)
+        Lam = np.array([ErgodicCoveragePreprocessor.sobolev_weight(int(k[0]), int(k[1]))
+                        for k in ks], dtype=float)
+        return BasisPack(phi=phi, Lam=Lam, ks=ks, Fk_grid=Fk_grid, dxdy=dxdy, hk=hk, pdf_img=pdf_img, gx_shape=gx.shape)

@@ -54,6 +54,10 @@ class Agent(Generic[T]):
     u_bounds: np.ndarray = None
     min_energy: float = None
 
+    # 
+    c: np.ndarray = None
+    c_dot: np.ndarray = None
+
     def __post_init__(self):
         """Initialize metadata as an empty dictionary if not provided."""
         if self.metadata is None:

@@ -14,7 +14,7 @@ from datatypes import *
 from evaluator import *
 from executor import ReachGoalExecutor, ErgodicCoverageExecutor
 from model import Model
-from objective import Objective, ReachGoalObjective, ErgodicCoverageObjective
+from objective import Objective, ReachGoalObjective
 from constraint import Constraint, ObstacleAvoidanceConstraint, InterRobotCollisionAvoidance
 
 class DSTATE(Allocator):
@@ -37,7 +37,6 @@ class DSTATE(Allocator):
         self._obstacles = obstacles
 
         self._reach_goal_objective = ReachGoalObjective()
-        self._ergodic_coverage_objective = ErgodicCoverageObjective()
 
         # Executor
         self._reach_goal_executor = ReachGoalExecutor()
@@ -373,13 +372,12 @@ class DSTATE(Allocator):
         horizon = 1
         lambda_k = np.ones(horizon) * agent.goal_lambda
         # Run optimization
-        U_opt, success = self._ergodic_coverage_executor.execute(
+        agent, U_opt, success = self._ergodic_coverage_executor.execute(
             agent=agent,
             other_agents=other_agents,
             scenario=scenario,
             task=task,
             lambda_k=lambda_k,
-            objective=self._ergodic_coverage_objective,
             horizon=horizon)
         if success:
             agent.control = U_opt            
